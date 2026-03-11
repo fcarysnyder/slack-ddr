@@ -1,8 +1,9 @@
 import Bolt from "@slack/bolt";
 import Anthropic from "@anthropic-ai/sdk";
 import express from "express";
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from "fs";
 import { join } from "path";
+import { randomUUID } from "crypto";
 import { config } from "dotenv";
 
 config();
@@ -11,6 +12,14 @@ const { App } = Bolt;
 
 // Directory for generated DDR files (./data; on Railway mount volume to /app/data).
 const DATA_DIR = join(process.cwd(), "data");
+const JOBS_DIR = join(DATA_DIR, "jobs");
+const JOB_PROGRESS = {
+  context: { percent: 10, label: "Assembling context" },
+  calling_model: { percent: 35, label: "Calling model" },
+  model_done: { percent: 75, label: "Model response received" },
+  writing_file: { percent: 90, label: "Writing markdown file" },
+  posting_result: { percent: 100, label: "Posting results" },
+};
 
 // ─── Initialize ─────────────────────────────────────────────────
 const app = new App({
@@ -130,7 +139,13 @@ app.command("/ddr", async ({ command, ack, client }) => {
   const initiatedBy = await resolveUserName(command.user_id, client);
 
   const sessionId = triggerId;
-  const metadata = { channelId, userId: command.user_id, initiatedBy, sessionId };
+  const metadata = {
+    channelId,
+    userId: command.user_id,
+    initiatedBy,
+    sessionId,
+    origin: "slash",
+  };
 
   await client.views.open({
     trigger_id: triggerId,
@@ -138,17 +153,53 @@ app.command("/ddr", async ({ command, ack, client }) => {
   });
 });
 
+app.command("/ddr-jobs", async ({ command, ack, client }) => {
+  await ack();
+
+  const query = parseDdrJobsQuery(command.text);
+  const jobs = loadAllJobs()
+    .filter((job) => {
+      if (query.jobId && job.id !== query.jobId) {
+        return false;
+      }
+      if (query.status && job.status !== query.status) {
+        return false;
+      }
+      if (query.scope !== "all" && job?.session?.userId !== command.user_id) {
+        return false;
+      }
+      return true;
+    })
+    .slice(0, query.limit);
+
+  const payload = buildDdrJobsPayload(jobs, { query });
+
+  try {
+    await client.chat.postEphemeral({
+      channel: command.channel_id,
+      user: command.user_id,
+      ...payload,
+    });
+  } catch (err) {
+    await client.chat.postMessage({
+      channel: command.user_id,
+      ...payload,
+    });
+  }
+});
+
 // ─── Modal Submission: Chooser ────────────────────────────────
 app.view("ddr_chooser_submit", async ({ ack, view, client }) => {
   const metadata = JSON.parse(view.private_metadata);
   const mode = view.state.values.chooser.mode.selected_option.value;
 
-  const { channelId, userId, initiatedBy, sessionId } = metadata;
+  const { channelId, userId, initiatedBy, sessionId, origin = "slash" } = metadata;
 
   sessions.set(sessionId, {
     channelId,
     userId,
     initiatedBy,
+    origin,
     sourceMessageTs: null,
     threadTs: undefined,
     sourceMessages: "",
@@ -344,6 +395,7 @@ app.shortcut("log_design_decision", async ({ shortcut, ack, client }) => {
     channelId,
     userId: shortcut.user.id,
     initiatedBy,
+    origin: "shortcut",
     sourceMessageTs: messageTs,
     threadTs: shortcut.message?.thread_ts || messageTs,
     sourceMessages: formattedMessages,
@@ -573,64 +625,73 @@ app.view("clarifying_submit", async ({ ack, view, client }) => {
 
   await ack();
 
-  await safePostEphemeralOrDM(
-    client,
-    session.channelId,
-    session.userId,
-    ":hourglass_flowing_sand: Creating DDR locally..."
-  );
+  const job = createDdrJob(session, sessionId);
+  await persistJob(job);
 
   try {
-    const markdown = await synthesizeDecision(session);
-
-    mkdirSync(DATA_DIR, { recursive: true });
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const filename = `design-decision-${timestamp}.md`;
-    const filepath = join(DATA_DIR, filename);
-    writeFileSync(filepath, markdown);
-
-    const baseText = `a ddr was created from this message (model: ${session.selectedModel || DEFAULT_MODEL})`;
-    const downloadUrl = process.env.PUBLIC_URL
-      ? `${process.env.PUBLIC_URL.replace(/\/$/, "")}/download/${filename}`
-      : null;
-    const designDecisionRecordsUrl =
-      "https://coda.io/d/Design-system_d_JJUOCLqA5/Design-Decision-Records-DDRs_su5gqDzd#Decisions_tuMiWlSr";
-    const designDecisionRecordsLink = `<${designDecisionRecordsUrl}| 🔗 Go to Design Decision Records>`;
-    const channelText = downloadUrl
-      ? `${baseText}\n<${downloadUrl}| 💾 Download .md file>\n${designDecisionRecordsLink}`
-      : `${baseText}\n${designDecisionRecordsLink}`;
-
-    try {
-      const postPayload = {
-        channel: session.channelId,
-        text: channelText,
-      };
-      if (session.threadTs) {
-        postPayload.thread_ts = session.threadTs;
-      }
-      await client.chat.postMessage(postPayload);
-    } catch (postErr) {
-      console.warn("Could not post to channel, falling back to DM", postErr.message);
-      const dmText = downloadUrl
-        ? `Your DDR was created, but I couldn't post in the channel. <${downloadUrl}|💾 Download .md file>\n${designDecisionRecordsLink}`
-        : `Your DDR was created and saved, but I couldn't post the confirmation in the original channel because I haven't been added to it.\n${designDecisionRecordsLink}`;
-      await client.chat.postMessage({
-        channel: session.userId,
-        text: dmText,
-      });
+    const progressRef = await postProgressMessage(client, job);
+    if (progressRef) {
+      job.progressChannel = progressRef.channel;
+      job.progressTs = progressRef.ts;
+      await persistJob(job);
     }
   } catch (err) {
-    console.error("Synthesis error:", err);
-    await safePostEphemeralOrDM(
-      client,
-      session.channelId,
-      session.userId,
-      `:x: Something went wrong generating the design decision: ${err.message}`
-    );
+    console.warn("[clarifying_submit] Unable to post initial progress", err.message);
   }
 
-  // Clean up session
-  sessions.delete(sessionId);
+  try {
+    await executeDdrJob(job, client);
+  } finally {
+    // Session data is now persisted in the job and no longer needs to stay in-memory.
+    sessions.delete(sessionId);
+  }
+});
+
+app.action("resume_ddr_job", async ({ ack, body, action, client }) => {
+  await ack();
+
+  const jobId = action?.value;
+  if (!jobId) {
+    return;
+  }
+
+  const job = loadJob(jobId);
+  if (!job) {
+    await safePostEphemeralOrDM(
+      client,
+      body.channel?.id,
+      body.user.id,
+      ":warning: I couldn't find that DDR recovery job anymore."
+    );
+    return;
+  }
+
+  if (job.status === "in_progress") {
+    await safePostEphemeralOrDM(
+      client,
+      body.channel?.id || job.session?.channelId,
+      body.user.id,
+      `:hourglass_flowing_sand: Job \`${job.id}\` is already running.`
+    );
+    return;
+  }
+
+  if (!job.session) {
+    await safePostEphemeralOrDM(
+      client,
+      body.channel?.id || job.session?.channelId,
+      body.user.id,
+      `:x: Job \`${job.id}\` is missing recovery context and cannot be resumed.`
+    );
+    return;
+  }
+
+  job.status = "in_progress";
+  job.updatedAt = Date.now();
+  job.lastError = null;
+  await persistJob(job);
+
+  await executeDdrJob(job, client, { resumedBy: body.user.id });
 });
 
 async function safePostEphemeralOrDM(client, channelId, userId, text) {
@@ -650,6 +711,534 @@ async function safePostEphemeralOrDM(client, channelId, userId, text) {
     } catch (dmErr) {
       console.warn("Could not post ephemeral or DM fallback:", dmErr.message);
     }
+  }
+}
+
+function parseDdrJobsQuery(text = "") {
+  const tokens = String(text)
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+
+  const query = {
+    scope: "mine",
+    status: null,
+    jobId: null,
+    limit: 8,
+  };
+
+  for (const token of tokens) {
+    const tokenLower = token.toLowerCase();
+    if (tokenLower === "all") {
+      query.scope = "all";
+      continue;
+    }
+    if (tokenLower === "mine") {
+      query.scope = "mine";
+      continue;
+    }
+    if (["failed", "completed", "in_progress"].includes(tokenLower)) {
+      query.status = tokenLower;
+      continue;
+    }
+    if (tokenLower.startsWith("ddr-")) {
+      query.jobId = token;
+      continue;
+    }
+    if (/^\d+$/.test(token)) {
+      query.limit = Math.max(1, Math.min(20, Number(token)));
+    }
+  }
+
+  return query;
+}
+
+function loadAllJobs() {
+  if (!existsSync(JOBS_DIR)) {
+    return [];
+  }
+
+  const files = readdirSync(JOBS_DIR)
+    .filter((name) => name.endsWith(".json"))
+    .slice(0, 500);
+
+  const jobs = [];
+  for (const filename of files) {
+    try {
+      const raw = readFileSync(join(JOBS_DIR, filename), "utf8");
+      const parsed = JSON.parse(raw);
+      if (parsed?.id) {
+        jobs.push(parsed);
+      }
+    } catch (err) {
+      console.warn("[loadAllJobs] Could not parse job file", {
+        filename,
+        message: err.message,
+      });
+    }
+  }
+
+  return jobs.sort((a, b) => {
+    const aTime = Number(a.updatedAt || a.createdAt || 0);
+    const bTime = Number(b.updatedAt || b.createdAt || 0);
+    return bTime - aTime;
+  });
+}
+
+function buildDdrJobsPayload(jobs, context) {
+  const { query } = context;
+  const statusText = query.status ? `status=${query.status}` : "status=any";
+  const scopeText = query.scope === "all" ? "scope=all" : "scope=mine";
+  const titleText = `Showing ${jobs.length} job(s) (${scopeText}, ${statusText}, limit=${query.limit})`;
+
+  const blocks = [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `*DDR Jobs*\n${titleText}`,
+      },
+    },
+    {
+      type: "context",
+      elements: [
+        {
+          type: "mrkdwn",
+          text: "Usage: `/ddr-jobs`, `/ddr-jobs failed`, `/ddr-jobs all failed 15`, `/ddr-jobs ddr-<id>`",
+        },
+      ],
+    },
+    {
+      type: "divider",
+    },
+  ];
+
+  if (jobs.length === 0) {
+    blocks.push({
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: "_No matching jobs found._",
+      },
+    });
+    return {
+      text: `DDR Jobs: ${titleText}`,
+      blocks,
+    };
+  }
+
+  for (const job of jobs) {
+    const stage = JOB_PROGRESS[job.stage]?.label || job.stage || "Unknown stage";
+    const updatedAt = formatTimestamp(job.updatedAt || job.createdAt);
+    const model = job?.session?.selectedModel || DEFAULT_MODEL;
+    const filename = job.filename ? `\nFile: \`${job.filename}\`` : "";
+    const downloadUrl = job.filename ? getJobDownloadUrl(job.filename) : null;
+    const downloadLine = downloadUrl ? `\nDownload: <${downloadUrl}|open file>` : "";
+    const errorLine = job.lastError?.code
+      ? `\nError: \`${job.lastError.code}\``
+      : "";
+
+    blocks.push({
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `*${job.id}* - \`${job.status}\`\nStage: ${stage}\nUpdated: ${updatedAt}\nModel: \`${model}\`${filename}${downloadLine}${errorLine}`,
+      },
+    });
+
+    if (job.status === "failed") {
+      blocks.push({
+        type: "actions",
+        elements: [
+          {
+            type: "button",
+            action_id: "resume_ddr_job",
+            text: {
+              type: "plain_text",
+              text: "Resume DDR generation",
+            },
+            style: "primary",
+            value: job.id,
+          },
+        ],
+      });
+    }
+
+    blocks.push({
+      type: "divider",
+    });
+  }
+
+  return {
+    text: `DDR Jobs: ${titleText}`,
+    blocks: blocks.slice(0, 50),
+  };
+}
+
+function formatTimestamp(epochMs) {
+  if (!epochMs) {
+    return "unknown";
+  }
+  try {
+    return new Date(epochMs).toLocaleString("en-US");
+  } catch {
+    return "unknown";
+  }
+}
+
+function getJobFilePath(jobId) {
+  return join(JOBS_DIR, `${jobId}.json`);
+}
+
+function getJobDownloadUrl(filename) {
+  if (!process.env.PUBLIC_URL) {
+    return null;
+  }
+  return `${process.env.PUBLIC_URL.replace(/\/$/, "")}/download/${filename}`;
+}
+
+function createDdrJob(session, sessionId) {
+  return {
+    id: `ddr-${randomUUID()}`,
+    status: "in_progress",
+    stage: "context",
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    sessionId,
+    session: JSON.parse(JSON.stringify(session)),
+    progressChannel: null,
+    progressTs: null,
+    filename: null,
+    lastError: null,
+  };
+}
+
+function loadJob(jobId) {
+  try {
+    const filepath = getJobFilePath(jobId);
+    if (!existsSync(filepath)) {
+      return null;
+    }
+    return JSON.parse(readFileSync(filepath, "utf8"));
+  } catch (err) {
+    console.warn("[loadJob] Failed to load job", { jobId, message: err.message });
+    return null;
+  }
+}
+
+async function persistJob(job) {
+  mkdirSync(JOBS_DIR, { recursive: true });
+  job.updatedAt = Date.now();
+  writeFileSync(getJobFilePath(job.id), JSON.stringify(job, null, 2), "utf8");
+}
+
+function renderAsciiProgressBar(percent, width = 20) {
+  const safePercent = Math.max(0, Math.min(100, Number(percent) || 0));
+  const filled = Math.round((safePercent / 100) * width);
+  const empty = width - filled;
+  return `[${"=".repeat(filled)}${" ".repeat(empty)}] ${safePercent}%`;
+}
+
+function buildProgressText(job, stageKey, extra = "") {
+  const stage = JOB_PROGRESS[stageKey] || { percent: 0, label: "Working" };
+  const base = [
+    ":hourglass_flowing_sand: Creating DDR locally...",
+    `\`${renderAsciiProgressBar(stage.percent)}\``,
+    `Stage: ${stage.label}`,
+    `Job ID: \`${job.id}\``,
+  ];
+  if (extra) {
+    base.push(extra);
+  }
+  return base.join("\n");
+}
+
+async function postProgressMessage(client, job) {
+  const session = job.session || {};
+  const text = buildProgressText(job, "context", "_You can keep working; I'll update this message._");
+
+  try {
+    if (session.origin === "slash") {
+      const result = await client.chat.postMessage({
+        channel: session.userId,
+        text,
+      });
+      return { channel: result.channel, ts: result.ts };
+    }
+
+    const payload = {
+      channel: session.channelId,
+      text,
+    };
+    if (session.threadTs) {
+      payload.thread_ts = session.threadTs;
+    }
+    const result = await client.chat.postMessage(payload);
+    return { channel: result.channel, ts: result.ts };
+  } catch (err) {
+    console.warn("[postProgressMessage] Channel/thread post failed, falling back to DM", err.message);
+    const dm = await client.chat.postMessage({
+      channel: session.userId,
+      text,
+    });
+    return { channel: dm.channel, ts: dm.ts };
+  }
+}
+
+async function updateProgressMessage(client, job, stageKey, extra = "") {
+  job.stage = stageKey;
+  await persistJob(job);
+
+  if (!job.progressChannel || !job.progressTs) {
+    return;
+  }
+
+  try {
+    await client.chat.update({
+      channel: job.progressChannel,
+      ts: job.progressTs,
+      text: buildProgressText(job, stageKey, extra),
+    });
+  } catch (err) {
+    console.warn("[updateProgressMessage] Unable to update progress message", err.message);
+  }
+}
+
+function classifySynthesisError(err) {
+  const status = err?.status || err?.statusCode || err?.response?.status || 0;
+  const raw = String(
+    err?.message ||
+      err?.error?.message ||
+      err?.response?.data?.error?.message ||
+      ""
+  ).toLowerCase();
+
+  if (
+    status === 429 ||
+    raw.includes("rate limit") ||
+    raw.includes("too many requests")
+  ) {
+    return {
+      code: "rate_limited",
+      retryable: true,
+      userMessage:
+        "Anthropic rate-limited this request. Please wait a minute, then click *Resume DDR generation*.",
+    };
+  }
+
+  if (
+    raw.includes("insufficient_quota") ||
+    raw.includes("credit") ||
+    raw.includes("billing") ||
+    raw.includes("quota") ||
+    raw.includes("usage limit")
+  ) {
+    return {
+      code: "budget_exhausted",
+      retryable: false,
+      userMessage:
+        "API usage/billing appears exhausted. After restoring budget, click *Resume DDR generation* to continue.",
+    };
+  }
+
+  if (
+    status === 401 ||
+    status === 403 ||
+    raw.includes("api key") ||
+    raw.includes("authentication")
+  ) {
+    return {
+      code: "auth_error",
+      retryable: false,
+      userMessage:
+        "Authentication with the model API failed (likely API key/config). Fix credentials, then click *Resume DDR generation*.",
+    };
+  }
+
+  if (
+    status >= 500 ||
+    raw.includes("overloaded") ||
+    raw.includes("temporarily unavailable") ||
+    raw.includes("timeout") ||
+    raw.includes("timed out") ||
+    raw.includes("econnreset") ||
+    raw.includes("enotfound") ||
+    raw.includes("fetch failed")
+  ) {
+    return {
+      code: "provider_unavailable",
+      retryable: true,
+      userMessage:
+        "The model API appears temporarily unavailable. Click *Resume DDR generation* to retry from saved context.",
+    };
+  }
+
+  return {
+    code: "unknown_error",
+    retryable: true,
+    userMessage:
+      "The DDR run failed unexpectedly. You can retry with *Resume DDR generation* from the saved job state.",
+  };
+}
+
+async function postRecoveryAction(client, job, detailsText) {
+  const destinationChannel = job.progressChannel || job.session?.userId;
+  if (!destinationChannel) {
+    return;
+  }
+
+  try {
+    await client.chat.postMessage({
+      channel: destinationChannel,
+      text: `DDR job ${job.id} failed. Use Resume DDR generation.`,
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: `:warning: *DDR generation failed*\n${detailsText}\nJob ID: \`${job.id}\``,
+          },
+        },
+        {
+          type: "actions",
+          elements: [
+            {
+              type: "button",
+              action_id: "resume_ddr_job",
+              text: {
+                type: "plain_text",
+                text: "Resume DDR generation",
+              },
+              style: "primary",
+              value: job.id,
+            },
+          ],
+        },
+      ],
+    });
+  } catch (err) {
+    console.warn("[postRecoveryAction] Unable to post recovery action", err.message);
+  }
+}
+
+async function postFinalDdrMessage(client, session, filename) {
+  const baseText = `a ddr was created from this message (model: ${session.selectedModel || DEFAULT_MODEL})`;
+  const downloadUrl = getJobDownloadUrl(filename);
+  const designDecisionRecordsUrl =
+    "https://coda.io/d/Design-system_d_JJUOCLqA5/Design-Decision-Records-DDRs_su5gqDzd#Decisions_tuMiWlSr";
+  const designDecisionRecordsLink = `<${designDecisionRecordsUrl}| 🔗 Go to Design Decision Records>`;
+  const channelText = downloadUrl
+    ? `${baseText}\n<${downloadUrl}| 💾 Download .md file>\n${designDecisionRecordsLink}`
+    : `${baseText}\n${designDecisionRecordsLink}`;
+
+  if (session.origin === "slash") {
+    await client.chat.postMessage({
+      channel: session.userId,
+      text: channelText,
+    });
+    return;
+  }
+
+  try {
+    const postPayload = {
+      channel: session.channelId,
+      text: channelText,
+    };
+    if (session.threadTs) {
+      postPayload.thread_ts = session.threadTs;
+    }
+    await client.chat.postMessage(postPayload);
+  } catch (postErr) {
+    console.warn("Could not post to channel, falling back to DM", postErr.message);
+    const dmText = downloadUrl
+      ? `Your DDR was created, but I couldn't post in the channel. <${downloadUrl}|💾 Download .md file>\n${designDecisionRecordsLink}`
+      : `Your DDR was created and saved, but I couldn't post the confirmation in the original channel because I haven't been added to it.\n${designDecisionRecordsLink}`;
+    await client.chat.postMessage({
+      channel: session.userId,
+      text: dmText,
+    });
+  }
+}
+
+async function executeDdrJob(job, client, options = {}) {
+  const session = job.session || {};
+
+  try {
+    await updateProgressMessage(
+      client,
+      job,
+      "context",
+      options.resumedBy ? `_Resumed by <@${options.resumedBy}>._` : "_Preparing generation request._"
+    );
+
+    await updateProgressMessage(client, job, "calling_model");
+    const markdown = await withTimeout(
+      synthesizeDecision(session),
+      120000,
+      "DDR synthesis timed out while waiting for model output"
+    );
+
+    await updateProgressMessage(client, job, "model_done");
+    await updateProgressMessage(client, job, "writing_file");
+
+    mkdirSync(DATA_DIR, { recursive: true });
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const filename = `design-decision-${timestamp}.md`;
+    const filepath = join(DATA_DIR, filename);
+    writeFileSync(filepath, markdown);
+    job.filename = filename;
+    await persistJob(job);
+
+    await updateProgressMessage(client, job, "posting_result");
+    await postFinalDdrMessage(client, session, filename);
+
+    job.status = "completed";
+    job.lastError = null;
+    await persistJob(job);
+
+    if (job.progressChannel && job.progressTs) {
+      await client.chat.update({
+        channel: job.progressChannel,
+        ts: job.progressTs,
+        text: [
+          ":white_check_mark: DDR generation complete.",
+          `\`${renderAsciiProgressBar(100)}\``,
+          `Job ID: \`${job.id}\``,
+          job.filename ? `Saved as \`${job.filename}\`.` : "",
+        ]
+          .filter(Boolean)
+          .join("\n"),
+      });
+    }
+  } catch (err) {
+    console.error("[executeDdrJob] Synthesis error:", err);
+    const diagnosis = classifySynthesisError(err);
+
+    job.status = "failed";
+    job.lastError = {
+      code: diagnosis.code,
+      message: err?.message || String(err),
+      retryable: diagnosis.retryable,
+      at: new Date().toISOString(),
+    };
+    await persistJob(job);
+
+    const failureText = [
+      diagnosis.userMessage,
+      job.filename
+        ? `Recovered work saved in \`${job.filename}\`${getJobDownloadUrl(job.filename) ? ` (<${getJobDownloadUrl(job.filename)}|download>)` : ""}.`
+        : "No markdown file was written yet, but all context is saved in this job.",
+    ].join("\n");
+
+    await updateProgressMessage(client, job, job.stage || "calling_model", `:x: ${diagnosis.userMessage}`);
+    await postRecoveryAction(client, job, failureText);
+
+    await safePostEphemeralOrDM(
+      client,
+      session.channelId,
+      session.userId,
+      `:x: ${diagnosis.userMessage}\nJob ID: \`${job.id}\``
+    );
   }
 }
 

@@ -1,168 +1,145 @@
 # Design Decision Logger
 
-A Slack app that synthesizes conversations into structured design decision logs (ADRs) using Claude.
+A Slack app that turns Slack discussions into structured Design Decision Records (DDRs) using Claude.
+
+## Slack App Description Snippet (Copy/Paste)
+
+Use this in your Slack app "App Description" field:
+
+```text
+Design Decision Logger helps teams capture architecture and product decisions from Slack conversations and save them as structured markdown Design Decision Records (DDRs).
+
+Commands and shortcuts:
+- /ddr
+  Starts the DDR flow with a chooser:
+  - Start from scratch: paste context manually.
+  - From a Slack message: provide links/notes to pull conversation context.
+  You can choose a Claude model, answer clarifying questions, then generate a DDR.
+
+- /ddr-jobs
+  Shows recent DDR jobs and their status (in_progress, completed, failed), including job IDs and recovery actions.
+  Examples:
+  - /ddr-jobs
+  - /ddr-jobs failed
+  - /ddr-jobs all failed 15
+  - /ddr-jobs ddr-<job-id>
+
+- Message shortcut: "Log Design Decision"
+  Run from any Slack message to capture that message/thread directly, then add extra links/notes before generating the DDR.
+
+What this app does:
+- Gathers thread content plus optional extra Slack links and notes
+- Asks clarifying questions before drafting
+- Generates a markdown DDR with standard sections (Problem, Decision, Consequences, Alternatives)
+- Saves files locally and provides a downloadable link when PUBLIC_URL is configured
+- Supports retry/resume for failed jobs
+
+Notes:
+- Text-only context in modal inputs (video links/uploads are rejected in those fields)
+- The app must be in the channel to read full thread context and post there
+```
+
+## Command and Shortcut Reference
+
+- `/ddr`: Starts a modal flow to create a DDR from scratch or from message-based context.
+- `/ddr-jobs`: Lists DDR jobs with filtering by status, scope (`mine` or `all`), job ID, and limit.
+- `Log Design Decision` (message shortcut): Captures the clicked message (and thread when available) and starts DDR creation.
 
 ## How It Works
 
-1. Open any Slack message > click **Connect to apps** (or **More actions**) > **Log Design Decision**
-2. The app captures the message (and its full thread if applicable)
-3. A modal pops up asking for additional context (more Slack links, notes)
-   and which Claude model to use
-4. Claude asks clarifying questions so you can fill in any missing context
-5. Claude synthesizes everything into a structured markdown decision log saved locally
-6. The channel gets a simple confirmation: `a ddr was created from this message`
+1. Start with `/ddr` or the `Log Design Decision` message shortcut.
+2. Add context (Slack links and notes) and select a Claude model.
+3. Answer clarifying questions.
+4. The app generates markdown and stores it in `data/`.
+5. Slack posts progress and completion updates, plus recovery actions if generation fails.
 
 ## Setup
 
 ### 1. Create the Slack App
 
-1. Go to [api.slack.com/apps](https://api.slack.com/apps)
-2. Click **Create New App** > **From scratch**
-3. Name it "Design Decision Logger" and select your workspace
+1. Go to [api.slack.com/apps](https://api.slack.com/apps).
+2. Click **Create New App** > **From scratch**.
+3. Name it "Design Decision Logger" and choose your workspace.
 
-### 2. Configure the App
+### 2. Configure Features
 
-**Enable Socket Mode** (this is the key for local development, no ngrok needed):
-1. Go to **Settings > Socket Mode** in the left sidebar
-2. Toggle it **ON**
-3. You'll be prompted to create an App-Level Token
-4. Give it a name like "socket-token" and add the scope `connections:write`
-5. Copy the token (starts with `xapp-`), you'll need it for `.env`
+Enable **Socket Mode**:
+1. Go to **Settings > Socket Mode**.
+2. Toggle **On**.
+3. Create an app-level token with `connections:write`.
+4. Save the token (`xapp-...`) for `.env`.
 
-**Create the Message Shortcut:**
-1. Go to **Features > Interactivity & Shortcuts**
-2. Toggle **Interactivity** ON
-3. Click **Create New Shortcut** > **On messages**
-4. Name: `Log Design Decision`
-5. Description: `Synthesize this conversation into a design decision log`
-6. Callback ID: `log_design_decision`
-7. Save changes, then reinstall the app to the workspace
+Create slash commands:
+1. Go to **Features > Slash Commands**.
+2. Add `/ddr` (short description: "Start a design decision record flow").
+3. Add `/ddr-jobs` (short description: "List/recover DDR generation jobs").
 
-**Set OAuth Scopes:**
-1. Go to **Features > OAuth & Permissions**
-2. Under **Bot Token Scopes**, add:
-   - `chat:write` (post messages)
-   - `channels:history` (read public channel messages)
-   - `groups:history` (read private channel messages)
-   - `im:write` (open DMs)
-   - `users:read` (resolve usernames)
-   - `files:write` (upload the markdown file)
-   - `commands` (for the shortcut)
+Create message shortcut:
+1. Go to **Features > Interactivity & Shortcuts**.
+2. Enable **Interactivity**.
+3. Click **Create New Shortcut** > **On messages**.
+4. Name: `Log Design Decision`.
+5. Callback ID: `log_design_decision`.
+6. Save and reinstall the app.
 
-**Install the App:**
-1. Go to **Settings > Install App**
-2. Click **Install to Workspace** and authorize
-3. Copy the **Bot User OAuth Token** (starts with `xoxb-`)
+Add OAuth scopes:
+1. Go to **Features > OAuth & Permissions**.
+2. Add bot scopes:
+   - `chat:write`
+   - `channels:history`
+   - `groups:history`
+   - `im:write`
+   - `users:read`
+   - `commands`
 
-### 3. Get Your Signing Secret
+Install app:
+1. Go to **Settings > Install App**.
+2. Install to workspace.
+3. Copy the bot token (`xoxb-...`).
 
-1. Go to **Settings > Basic Information**
-2. Under **App Credentials**, find and copy the **Signing Secret**
+### 3. Get Signing Secret
 
-### 4. Set Up the Project
+1. Go to **Settings > Basic Information**.
+2. Copy **Signing Secret** from **App Credentials**.
+
+### 4. Local Project Setup
 
 ```bash
-# Clone / copy the project
-cd design-decision-logger
-
-# Install dependencies
 npm install
-
-# Create your .env file
 cp .env.example .env
 ```
 
-Edit `.env` with your tokens:
-```
+Set `.env` values:
+
+```text
 SLACK_BOT_TOKEN=xoxb-your-bot-token
 SLACK_SIGNING_SECRET=your-signing-secret
 SLACK_APP_TOKEN=xapp-your-app-level-token
 ANTHROPIC_API_KEY=sk-ant-your-key
+# Optional but recommended for download links:
+PUBLIC_URL=https://your-hostname
 ```
 
-### 5. Run It
+### 5. Run
 
 ```bash
 npm run dev
 ```
 
-You should see:
-```
-⚡ Design Decision Logger is running on port 3000
-   Using Socket Mode (no public URL needed for local dev!)
-```
+## Output and Storage
 
-### 6. Test It
+- Generated markdown files are saved in `data/` as `design-decision-<timestamp>.md`.
+- Job state is persisted in `data/jobs/` for recovery and `/ddr-jobs`.
+- If `PUBLIC_URL` is configured, Slack messages include a direct download link.
 
-1. Go to any Slack message
-2. Click the three dots (or right-click)
-3. Look for `Log Design Decision` under **Connect to apps**
-4. If you don't see it, check **More actions** and ensure the app was reinstalled after adding the shortcut
+## Troubleshooting
 
-## Debug Checklist
-
-If the shortcut is missing or the app is not running:
-
-1. Confirm startup works:
-   ```bash
-   npm run dev
-   ```
-2. Verify `.env` contains all 4 required values (`SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_APP_TOKEN`, `ANTHROPIC_API_KEY`)
-3. In Slack app config, verify:
-   - Message shortcut callback id is exactly `log_design_decision`
-   - Socket Mode is enabled
-   - Bot scopes were added and app was reinstalled
-4. Re-open Slack (or refresh) and test again from **Connect to apps** on a message
-5. If model list is empty in the modal, confirm your Anthropic key can access
-   models in the selected org/workspace and retry
-
-## Output
-
-Decision logs are saved to each user's local `~/Downloads` folder. The app does not upload the markdown into Slack.
-
-## Architecture
-
-```
-Slack Message Action
-  |
-  v
-Bolt (Socket Mode, runs locally)
-  |
-  ├── Fetches thread / linked messages via Slack API
-  ├── Opens modal for additional context
-  |
-  v
-Claude API (synthesizes into structured ADR)
-  |
-  v
-Markdown file + Slack DM
-```
-
-## Moving to Production
-
-When you're ready to host this permanently (so it works even when your laptop is closed):
-
-1. **Cheapest**: Deploy to Railway, Render, or Fly.io (free tier or ~$5/mo)
-2. **Serverless**: Adapt to Cloudflare Workers or Vercel (requires switching from Socket Mode to HTTP mode with a public URL)
-3. Socket Mode works great for personal use from a laptop or always-on machine
-
-### Railway: "App did not respond" for /ddr
-
-Slack shows this when the slash command is sent but the app doesn't acknowledge within ~3 seconds. Common causes:
-
-1. **Process not running or crashing**  
-   In Railway: open your service → **Deployments** → latest deployment → **View Logs**. Confirm you see `Design Decision Logger is running` and `Socket Mode (Bolt) on port 3001`. If the process exits or throws on startup, fix the error (often a missing env var).
-
-2. **Wrong or missing env vars**  
-   In Railway: **Variables** must include exactly the same four as local dev:
-   - `SLACK_BOT_TOKEN` (xoxb-...)
-   - `SLACK_SIGNING_SECRET`
-   - `SLACK_APP_TOKEN` (xapp-...), required for Socket Mode
-   - `ANTHROPIC_API_KEY`  
-   Use the tokens from the **same** Slack app that is installed in the workspace where you run `/ddr`. If you use a different Slack app for production, its tokens must be in Railway.
-
-3. **Socket Mode not connected**  
-   If logs show the app started but `/ddr` still fails, the WebSocket to Slack may be failing (e.g. bad `SLACK_APP_TOKEN` or Slack app has Socket Mode off). In [api.slack.com](https://api.slack.com/apps) → your app → **Settings → Socket Mode**: ensure it is ON and the app-level token has `connections:write`.
-
-4. **Which app handles /ddr**  
-   The workspace can have multiple apps with a `/ddr` command. When you type `/ddr`, Slack sends the event to the app you chose (the one installed for that workspace). That app’s tokens must be the ones in Railway so the deployed process receives the event.
+- Slash command says "app did not respond":
+  - Confirm process is running and Socket Mode is connected.
+  - Verify `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `SLACK_APP_TOKEN`, `ANTHROPIC_API_KEY`.
+  - Ensure `/ddr` and `/ddr-jobs` are created on the same Slack app as your tokens.
+- Shortcut missing:
+  - Verify callback ID is `log_design_decision`.
+  - Reinstall app after adding or editing shortcuts/scopes.
+- Thread not captured:
+  - Add the app to that channel first.
