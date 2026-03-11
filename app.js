@@ -120,6 +120,181 @@ app.options({ action_id: "model_choice" }, async ({ ack, body }) => {
   }
 });
 
+// ─── Slash Command: /ddr ───────────────────────────────────────
+// Opens a chooser modal to start from scratch or from a Slack message.
+app.command("/ddr", async ({ command, ack, client }) => {
+  await ack();
+
+  const triggerId = command.trigger_id;
+  const channelId = command.channel_id;
+  const initiatedBy = await resolveUserName(command.user_id, client);
+
+  const sessionId = triggerId;
+  const metadata = { channelId, userId: command.user_id, initiatedBy, sessionId };
+
+  await client.views.open({
+    trigger_id: triggerId,
+    view: buildDdrChooserModal(sessionId, metadata),
+  });
+});
+
+// ─── Modal Submission: Chooser ────────────────────────────────
+app.view("ddr_chooser_submit", async ({ ack, view, client }) => {
+  const metadata = JSON.parse(view.private_metadata);
+  const mode = view.state.values.chooser.mode.selected_option.value;
+
+  const { channelId, userId, initiatedBy, sessionId } = metadata;
+
+  sessions.set(sessionId, {
+    channelId,
+    userId,
+    initiatedBy,
+    sourceMessageTs: null,
+    threadTs: undefined,
+    sourceMessages: "",
+    additionalContext: [],
+    pendingLinkInputs: [],
+    clarifyingQuestions: [],
+    selectedModel: DEFAULT_MODEL,
+    createdAt: Date.now(),
+    appNotInChannel: false,
+  });
+
+  if (mode === "from_scratch") {
+    await ack({
+      response_action: "update",
+      view: buildFromScratchModal(sessionId, DEFAULT_MODEL),
+    });
+  } else {
+    const noMessagePlaceholder =
+      "(No message selected. Add Slack message links and/or notes in the form below.)";
+    const session = sessions.get(sessionId);
+    session.sourceMessages = noMessagePlaceholder;
+
+    await ack({
+      response_action: "update",
+      view: buildGatherContextModal(
+        sessionId,
+        noMessagePlaceholder,
+        [],
+        DEFAULT_MODEL,
+        false
+      ),
+    });
+  }
+});
+
+// ─── Modal Submission: From Scratch ───────────────────────────
+app.view("scratch_prompt_submit", async ({ ack, view, client }) => {
+  const sessionId = view.private_metadata;
+  const session = sessions.get(sessionId);
+
+  if (!session) {
+    console.warn("[scratch_prompt_submit] Missing session", { sessionId });
+    await ack({
+      response_action: "update",
+      view: buildSessionExpiredModal(sessionId),
+    });
+    return;
+  }
+
+  const promptText = view.state.values.scratch_prompt?.prompt_input?.value || "";
+  const selectedModel =
+    view.state.values.model_select?.model_choice?.selected_option?.value ||
+    DEFAULT_MODEL;
+
+  session.sourceMessages = promptText;
+  session.selectedModel = selectedModel;
+
+  // Continue directly to clarifying questions
+  await ack({
+    response_action: "update",
+    view: buildClarifyingLoadingModal(sessionId, pickRandomThinkingWord()),
+  });
+  console.log("[scratch_prompt_submit] Acked with loading modal", { sessionId });
+  const loadingStartedAt = Date.now();
+
+  const stopLoadingUpdates = startClarifyingLoadingUpdates(
+    client,
+    view.id,
+    sessionId
+  );
+
+  try {
+    console.log("[scratch_prompt_submit] Generating clarifying questions", {
+      sessionId,
+    });
+    const questions = await withTimeout(
+      generateClarifyingQuestions(session),
+      25000,
+      "clarifying question generation timed out"
+    );
+    session.clarifyingQuestions = questions;
+    console.log("[scratch_prompt_submit] Clarifying questions generated", {
+      sessionId,
+      count: questions.length,
+    });
+
+    await ensureMinimumElapsed(loadingStartedAt, 3000);
+    await client.views.update({
+      view_id: view.id,
+      view: buildClarifyingQuestionsModal(
+        sessionId,
+        session.sourceMessages,
+        questions,
+        session.additionalContext
+      ),
+    });
+    console.log("[scratch_prompt_submit] Updated to clarifying modal", {
+      sessionId,
+    });
+    stopLoadingUpdates();
+  } catch (err) {
+    console.error("[scratch_prompt_submit] Clarifying flow error:", err);
+    const fallbackQuestions = [
+      "What exact problem are we trying to solve?",
+      "What decision should be documented as the outcome?",
+      "What are the key tradeoffs or risks?",
+      "What alternatives were considered and why not chosen?",
+      "Any more context to include before finalizing?",
+    ];
+    session.clarifyingQuestions = fallbackQuestions;
+
+    try {
+      await ensureMinimumElapsed(loadingStartedAt, 3000);
+      await client.views.update({
+        view_id: view.id,
+        view: buildClarifyingQuestionsModal(
+          sessionId,
+          session.sourceMessages,
+          fallbackQuestions,
+          session.additionalContext
+        ),
+      });
+      stopLoadingUpdates();
+      await safePostEphemeralOrDM(
+        client,
+        session.channelId,
+        session.userId,
+        ":warning: Clarifying question generation was slow, so I used fallback questions. You can continue."
+      );
+    } catch (updateErr) {
+      console.error(
+        "[scratch_prompt_submit] Fallback clarifying modal update error:",
+        updateErr
+      );
+      stopLoadingUpdates();
+      await safePostEphemeralOrDM(
+        client,
+        session.channelId,
+        session.userId,
+        ":x: I hit a timeout preparing clarifying questions. Please retry the shortcut."
+      );
+      sessions.delete(sessionId);
+    }
+  }
+});
+
 // ─── Message Shortcut: "Log Design Decision" ───────────────────
 // This fires when a user clicks the shortcut from the message context menu.
 app.shortcut("log_design_decision", async ({ shortcut, ack, client }) => {
@@ -418,19 +593,27 @@ app.view("clarifying_submit", async ({ ack, view, client }) => {
     const downloadUrl = process.env.PUBLIC_URL
       ? `${process.env.PUBLIC_URL.replace(/\/$/, "")}/download/${filename}`
       : null;
-    const channelText = downloadUrl ? `${baseText}\n<${downloadUrl}|Download .md>` : baseText;
+    const designDecisionRecordsUrl =
+      "https://coda.io/d/Design-system_d_JJUOCLqA5/Design-Decision-Records-DDRs_su5gqDzd#Decisions_tuMiWlSr";
+    const designDecisionRecordsLink = `<${designDecisionRecordsUrl}| 🔗 Go to Design Decision Records>`;
+    const channelText = downloadUrl
+      ? `${baseText}\n<${downloadUrl}| 💾 Download .md file>\n${designDecisionRecordsLink}`
+      : `${baseText}\n${designDecisionRecordsLink}`;
 
     try {
-      await client.chat.postMessage({
+      const postPayload = {
         channel: session.channelId,
-        thread_ts: session.threadTs,
         text: channelText,
-      });
+      };
+      if (session.threadTs) {
+        postPayload.thread_ts = session.threadTs;
+      }
+      await client.chat.postMessage(postPayload);
     } catch (postErr) {
       console.warn("Could not post to channel, falling back to DM", postErr.message);
       const dmText = downloadUrl
-        ? `Your DDR was created, but I couldn't post in the channel. <${downloadUrl}|Download .md>`
-        : `Your DDR was created and saved, but I couldn't post the confirmation in the original channel because I haven't been added to it.`;
+        ? `Your DDR was created, but I couldn't post in the channel. <${downloadUrl}|💾 Download .md file>\n${designDecisionRecordsLink}`
+        : `Your DDR was created and saved, but I couldn't post the confirmation in the original channel because I haven't been added to it.\n${designDecisionRecordsLink}`;
       await client.chat.postMessage({
         channel: session.userId,
         text: dmText,
@@ -609,8 +792,9 @@ function containsVideoReference(text = "") {
 
 async function synthesizeDecision(session) {
   const dateProposed = new Date().toLocaleDateString("en-US");
+  const sourceLabel = session.sourceMessageTs ? "--- Original Thread/Message ---" : "--- User-Provided Context ---";
   const allContext = [
-    "--- Original Thread/Message ---",
+    sourceLabel,
     session.sourceMessages,
     `--- Decision Metadata Defaults ---\nAuthor: ${
       session.initiatedBy || session.userId
@@ -728,8 +912,9 @@ async function resolveUserName(userId, client) {
 }
 
 async function generateClarifyingQuestions(session) {
+  const sourceLabel = session.sourceMessageTs ? "--- Original Thread/Message ---" : "--- User-Provided Context ---";
   const context = [
-    "--- Original Thread/Message ---",
+    sourceLabel,
     session.sourceMessages,
     ...session.additionalContext,
   ].join("\n\n");
@@ -777,6 +962,120 @@ Return ONLY a bullet list of 3-6 short questions, one question per line, each st
     "What alternatives were considered and why were they not chosen?",
     "Is there any other Slack link/context/content we should include?",
   ];
+}
+
+function buildDdrChooserModal(sessionId, metadata) {
+  return {
+    type: "modal",
+    callback_id: "ddr_chooser_submit",
+    private_metadata: JSON.stringify(metadata),
+    title: {
+      type: "plain_text",
+      text: "Log Design Decision",
+    },
+    submit: {
+      type: "plain_text",
+      text: "Next",
+    },
+    close: {
+      type: "plain_text",
+      text: "Cancel",
+    },
+    blocks: [
+      {
+        type: "input",
+        block_id: "chooser",
+        element: {
+          type: "radio_buttons",
+          action_id: "mode",
+          initial_option: {
+            text: {
+              type: "plain_text",
+              text: "Start from scratch",
+            },
+            value: "from_scratch",
+          },
+          options: [
+            {
+              text: {
+                type: "plain_text",
+                text: "Start from scratch",
+              },
+              value: "from_scratch",
+            },
+            {
+              text: {
+                type: "plain_text",
+                text: "From a Slack message",
+              },
+              value: "from_message",
+            },
+          ],
+        },
+        label: {
+          type: "plain_text",
+          text: "How would you like to start?",
+        },
+      },
+    ],
+  };
+}
+
+function buildFromScratchModal(sessionId, selectedModel = DEFAULT_MODEL) {
+  return {
+    type: "modal",
+    callback_id: "scratch_prompt_submit",
+    private_metadata: sessionId,
+    title: {
+      type: "plain_text",
+      text: "Design Decision Log",
+    },
+    submit: {
+      type: "plain_text",
+      text: "Submit",
+    },
+    close: {
+      type: "plain_text",
+      text: "Cancel",
+    },
+    blocks: [
+      {
+        type: "input",
+        block_id: "scratch_prompt",
+        element: {
+          type: "plain_text_input",
+          action_id: "prompt_input",
+          multiline: true,
+          placeholder: {
+            type: "plain_text",
+            text: "Describe the design decision, problem, and context...",
+          },
+        },
+        label: {
+          type: "plain_text",
+          text: "Decision Details",
+        },
+      },
+      {
+        type: "input",
+        block_id: "model_select",
+        element: {
+          type: "external_select",
+          action_id: "model_choice",
+          min_query_length: 0,
+          placeholder: {
+            type: "plain_text",
+            text: "Choose a Claude model",
+          },
+          initial_option: buildModelOption(selectedModel),
+        },
+        label: {
+          type: "plain_text",
+          text: "Claude Model",
+        },
+      },
+    ],
+  };
 }
 
 function buildGatherContextModal(

@@ -145,3 +145,24 @@ When you're ready to host this permanently (so it works even when your laptop is
 1. **Cheapest**: Deploy to Railway, Render, or Fly.io (free tier or ~$5/mo)
 2. **Serverless**: Adapt to Cloudflare Workers or Vercel (requires switching from Socket Mode to HTTP mode with a public URL)
 3. Socket Mode works great for personal use from a laptop or always-on machine
+
+### Railway: "App did not respond" for /ddr
+
+Slack shows this when the slash command is sent but the app doesn't acknowledge within ~3 seconds. Common causes:
+
+1. **Process not running or crashing**  
+   In Railway: open your service → **Deployments** → latest deployment → **View Logs**. Confirm you see `Design Decision Logger is running` and `Socket Mode (Bolt) on port 3001`. If the process exits or throws on startup, fix the error (often a missing env var).
+
+2. **Wrong or missing env vars**  
+   In Railway: **Variables** must include exactly the same four as local dev:
+   - `SLACK_BOT_TOKEN` (xoxb-...)
+   - `SLACK_SIGNING_SECRET`
+   - `SLACK_APP_TOKEN` (xapp-...), required for Socket Mode
+   - `ANTHROPIC_API_KEY`  
+   Use the tokens from the **same** Slack app that is installed in the workspace where you run `/ddr`. If you use a different Slack app for production, its tokens must be in Railway.
+
+3. **Socket Mode not connected**  
+   If logs show the app started but `/ddr` still fails, the WebSocket to Slack may be failing (e.g. bad `SLACK_APP_TOKEN` or Slack app has Socket Mode off). In [api.slack.com](https://api.slack.com/apps) → your app → **Settings → Socket Mode**: ensure it is ON and the app-level token has `connections:write`.
+
+4. **Which app handles /ddr**  
+   The workspace can have multiple apps with a `/ddr` command. When you type `/ddr`, Slack sends the event to the app you chose (the one installed for that workspace). That app’s tokens must be the ones in Railway so the deployed process receives the event.
