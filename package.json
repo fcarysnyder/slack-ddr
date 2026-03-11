@@ -1,0 +1,17 @@
+{
+  "name": "design-decision-logger",
+  "version": "1.0.0",
+  "description": "Slack app that synthesizes conversations into structured design decision logs",
+  "main": "app.js",
+  "type": "module",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "node --watch app.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@slack/bolt": "^4.1.0",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1"
+  }
+}

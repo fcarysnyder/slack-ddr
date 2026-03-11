@@ -1,0 +1,18 @@
+# Secrets and env (keep .env.example)
+.env
+.env.local
+.env.*.local
+
+# Dependencies
+node_modules/
+
+# OS and editor
+.DS_Store
+*.log
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Optional: uncomment to ignore Cursor plans/state
+# .cursor/
