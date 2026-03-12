@@ -97,6 +97,12 @@ const pendingShortcutContexts = new Map();
 
 // HTTP server for file downloads (used when deployed; links in Slack point here).
 const downloadApp = express();
+let boltConnected = false;
+
+downloadApp.get("/health", (_req, res) => {
+  res.status(200).json({ ok: true, bolt: boltConnected });
+});
+
 downloadApp.get("/download/:filename", (req, res) => {
   const filename = req.params.filename.replace(/\.\./g, "").replace(/[/\\]/g, "");
   if (!filename.endsWith(".md")) {
@@ -2413,6 +2419,19 @@ function buildShortcutDocumentTypeChooserModal(
       type: "section",
       text: {
         type: "mrkdwn",
+        text:
+          "*DDR* — a decision has been made or proposed. Documents the problem, decision, tradeoffs, and alternatives.\n"
+          + "*ODC* — the problem is still open. Captures the tension, why it's hard, paths considered, and cost of inaction.\n\n"
+          + "_Next steps:_ choose a type → provide context → answer clarifying questions → AI generates the document.",
+      },
+    },
+    {
+      type: "divider",
+    },
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
         text: `:clipboard: *Captured conversation preview:*\n\`\`\`${contextPreview}...\`\`\``,
       },
     },
@@ -2500,7 +2519,27 @@ function buildChooserModal(sessionId, metadata) {
   const isOdc = documentType === DOCUMENT_TYPES.ODC;
   const noun = isOdc ? "ODC" : "DDR";
 
+  const description = isOdc
+    ? "*Open Design Challenge (ODC)* — captures an unresolved design tension without advocating for a specific path. "
+      + "ODCs stay in problem space: what's hard, what paths exist, and what happens if nothing changes.\n\n"
+      + "_Next steps:_ provide context → answer clarifying questions → AI generates an ODC document.\n\n"
+      + "> _Not sure which to use? Pick *ODC* when the problem is still open. Pick *DDR* when a decision has been made or proposed._"
+    : "*Design Decision Record (DDR)* — documents a design decision that's been made or proposed, including the problem, "
+      + "the decision, tradeoffs, and alternatives considered.\n\n"
+      + "_Next steps:_ provide context → answer clarifying questions → AI generates a DDR document.\n\n"
+      + "> _Not sure which to use? Pick *DDR* when a decision has been made or proposed. Pick *ODC* when the problem is still open._";
+
   const blocks = [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: description,
+      },
+    },
+    {
+      type: "divider",
+    },
     {
       type: "input",
       block_id: "chooser",
@@ -2998,15 +3037,49 @@ function buildClarifyingQuestionsModal(
 const httpPort = Number(process.env.PORT) || 3000;
 const boltPort = 3001;
 
+function listenAsync(server, port) {
+  return new Promise((resolve, reject) => {
+    server.listen(port, () => resolve());
+    server.once("error", reject);
+  });
+}
+
+async function connectBoltWithRetry(maxRetries = 5) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      await app.start(boltPort);
+      boltConnected = true;
+      console.log(`⚡ Bolt Socket Mode connected (attempt ${attempt})`);
+      return;
+    } catch (err) {
+      console.error(`[startup] Bolt connect attempt ${attempt}/${maxRetries} failed:`, err.message);
+      if (attempt < maxRetries) {
+        const delay = Math.min(2000 * attempt, 10000);
+        console.log(`[startup] Retrying Bolt connection in ${delay}ms...`);
+        await sleep(delay);
+      } else {
+        console.error("[startup] All Bolt connection attempts exhausted. The HTTP server is still running; restart to retry.");
+      }
+    }
+  }
+}
+
 (async () => {
   try {
-    downloadApp.listen(httpPort, () => {
-      console.log(`📥 Download server listening on port ${httpPort}`);
-    });
-    await app.start(boltPort);
+    await listenAsync(downloadApp, httpPort);
+    console.log(`📥 Download server listening on port ${httpPort}`);
+  } catch (err) {
+    console.error("[startup] Failed to start HTTP server:", err);
+    process.exit(1);
+  }
+
+  connectBoltWithRetry().then(() => {
     console.log("⚡ Design Decision Logger is running");
     console.log(`   Socket Mode (Bolt) on port ${boltPort}, downloads on port ${httpPort}`);
-  } catch (err) {
-    console.error("[startup] Failed to start app:", err);
-  }
+  });
 })();
+
+process.on("SIGTERM", () => {
+  console.log("[shutdown] SIGTERM received, shutting down gracefully");
+  process.exit(0);
+});
