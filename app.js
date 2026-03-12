@@ -1210,6 +1210,18 @@ function getDesignDecisionRecordsUrl() {
   return DEFAULT_DESIGN_DECISION_RECORDS_URL;
 }
 
+function getDocumentTableUrl(documentType = DOCUMENT_TYPES.DDR) {
+  if (documentType === DOCUMENT_TYPES.ODC) {
+    const docId = process.env.CODA_DOC_ODC_ID;
+    const tableId = process.env.CODA_TABLE_ODC_ID;
+    if (docId && tableId) {
+      return `https://coda.io/d/_d${docId}#_tu${tableId}`;
+    }
+    return DEFAULT_DESIGN_DECISION_RECORDS_URL;
+  }
+  return getDesignDecisionRecordsUrl();
+}
+
 function isSlackChannelId(value = "") {
   return /^[CGD][A-Z0-9]+$/i.test(String(value || "").trim());
 }
@@ -1406,8 +1418,8 @@ function normalizeMarkdownForCoda(text = "") {
   normalized = normalized
     // Remove markdown heading markers so table cells read naturally.
     .replace(/^#{1,6}\s+/gm, "")
-    // Convert markdown links to readable text with URL.
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, "$1 ($2)")
+    // Keep bare URLs so Coda can render clickable links.
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, "$2 ($1)")
     // Keep content but strip common inline markdown markers.
     .replace(/\*\*([^*]+)\*\*/g, "$1")
     .replace(/`([^`]+)`/g, "$1")
@@ -1520,6 +1532,10 @@ async function publishToCoda(session, parsedSections, documentType = DOCUMENT_TY
     const { docId, tableId, tablePath } = getCodaTablePath(documentType);
     const today = new Date().toLocaleDateString("en-US");
     const slackReferencesValue = formatSlackReferencesForCoda(session?.slackReferences || []);
+    const additionalContextWithSlackLinks = appendSlackLinksToContext(
+      parsedSections.additionalContext,
+      session?.slackReferences || []
+    );
     const slackReferencesColumn = getOptionalCodaColumnId(columnMap, "Slack References");
     const cells =
       documentType === DOCUMENT_TYPES.ODC
@@ -1550,7 +1566,7 @@ async function publishToCoda(session, parsedSections, documentType = DOCUMENT_TY
             },
             {
               column: getRequiredCodaColumnId(columnMap, "Additional Context"),
-              value: normalizeMarkdownForCoda(parsedSections.additionalContext),
+              value: normalizeMarkdownForCoda(additionalContextWithSlackLinks),
             },
             {
               column: getRequiredCodaColumnId(columnMap, "Status"),
@@ -1596,7 +1612,7 @@ async function publishToCoda(session, parsedSections, documentType = DOCUMENT_TY
             },
             {
               column: getRequiredCodaColumnId(columnMap, "Additional Context"),
-              value: normalizeMarkdownForCoda(parsedSections.additionalContext),
+              value: normalizeMarkdownForCoda(additionalContextWithSlackLinks),
             },
             ...(slackReferencesColumn && slackReferencesValue
               ? [
@@ -1900,8 +1916,9 @@ async function postFinalDdrMessage(client, session, filename) {
   const codaRecordLink = session.codaRowUrl
     ? `<${session.codaRowUrl}| 🔗 Link to record>`
     : null;
-  const designDecisionRecordsLink = `<${getDesignDecisionRecordsUrl()}| 🔗 Go to Design Decision Records>`;
-  const fallbackLink = codaRecordLink || designDecisionRecordsLink;
+  const recordsLabel = documentType === DOCUMENT_TYPES.ODC ? "Open Design Challenges" : "Design Decision Records";
+  const recordsTableLink = `<${getDocumentTableUrl(documentType)}| 🔗 Go to ${recordsLabel}>`;
+  const fallbackLink = codaRecordLink || recordsTableLink;
   const codaWarning = session.codaError
     ? `:warning: Could not publish to Coda: ${session.codaError}`
     : null;
@@ -2424,8 +2441,29 @@ function formatSlackReferencesForCoda(references = []) {
     return "";
   }
   return deduped
-    .map((item, index) => `${index + 1}. ${item.label} - ${item.url}`)
+    .map((item, index) => `${index + 1}. ${item.url} (${item.label})`)
     .join("\n");
+}
+
+function appendSlackLinksToContext(context = "", references = []) {
+  const deduped = dedupeSlackReferences(references);
+  if (deduped.length === 0) {
+    return String(context || "").trim();
+  }
+
+  const existing = String(context || "");
+  const hasAnySlackUrl = deduped.some((item) =>
+    existing.toLowerCase().includes(String(item.url || "").toLowerCase())
+  );
+  if (hasAnySlackUrl) {
+    return existing.trim();
+  }
+
+  const linksBlock = deduped
+    .map((item, index) => `${index + 1}. ${item.url} (${item.label})`)
+    .join("\n");
+
+  return [existing.trim(), "Slack links:", linksBlock].filter(Boolean).join("\n\n");
 }
 
 async function buildSlackImageBlocks(session) {
