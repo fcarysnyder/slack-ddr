@@ -35,10 +35,20 @@ const anthropic = new Anthropic({
 
 const DEFAULT_MODEL = "claude-sonnet-4-20250514";
 const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
+const CODA_API_BASE = "https://coda.io/apis/v1";
+const DEFAULT_DESIGN_DECISION_RECORDS_URL =
+  "https://coda.io/d/Design-system_d_JJUOCLqA5/Design-Decision-Records-DDRs_su5gqDzd#Decisions_tuMiWlSr";
+const CODA_FEATURE_ENABLED = Boolean(process.env.CODA_API_TOKEN);
+const CODA_DEFAULT_STATUS = process.env.CODA_DEFAULT_STATUS || "Under Review";
+const CODA_COLUMN_ALIASES = {
+  Title: ["Title", "Name"],
+  "Date Proposed": ["Date Proposed", "Date proposed", "Date Created", "Date created"],
+};
 let modelOptionsCache = {
   fetchedAt: 0,
   options: [],
 };
+const codaColumnsCache = new Map();
 
 const THINKING_WORDS = [
   "thinking",
@@ -192,6 +202,17 @@ app.command("/ddr-jobs", async ({ command, ack, client }) => {
 app.view("ddr_chooser_submit", async ({ ack, view, client }) => {
   const metadata = JSON.parse(view.private_metadata);
   const mode = view.state.values.chooser.mode.selected_option.value;
+  const publishToCoda = getPublishToCodaValue(view.state.values);
+  const ddrTitle = (view.state.values.ddr_title?.title_input?.value || "").trim();
+  if (publishToCoda && !ddrTitle) {
+    await ack({
+      response_action: "errors",
+      errors: {
+        ddr_title: "DDR Title is required when Publish to Coda is checked.",
+      },
+    });
+    return;
+  }
 
   const { channelId, userId, initiatedBy, sessionId, origin = "slash" } = metadata;
 
@@ -207,6 +228,10 @@ app.view("ddr_chooser_submit", async ({ ack, view, client }) => {
     pendingLinkInputs: [],
     clarifyingQuestions: [],
     selectedModel: DEFAULT_MODEL,
+    publishToCoda,
+    ddrTitle,
+    codaRowUrl: null,
+    codaError: null,
     createdAt: Date.now(),
     appNotInChannel: false,
   });
@@ -229,7 +254,9 @@ app.view("ddr_chooser_submit", async ({ ack, view, client }) => {
         noMessagePlaceholder,
         [],
         DEFAULT_MODEL,
-        false
+        false,
+        session.publishToCoda,
+        session.ddrTitle
       ),
     });
   }
@@ -403,6 +430,10 @@ app.shortcut("log_design_decision", async ({ shortcut, ack, client }) => {
     pendingLinkInputs: [],
     clarifyingQuestions: [],
     selectedModel: DEFAULT_MODEL,
+    publishToCoda: false,
+    ddrTitle: "",
+    codaRowUrl: null,
+    codaError: null,
     createdAt: Date.now(),
     appNotInChannel,
   });
@@ -415,7 +446,9 @@ app.shortcut("log_design_decision", async ({ shortcut, ack, client }) => {
       formattedMessages,
       [],
       DEFAULT_MODEL,
-      appNotInChannel
+      appNotInChannel,
+      false,
+      ""
     ),
   });
 });
@@ -441,6 +474,8 @@ app.view("gather_context_submit", async ({ ack, body, view, client }) => {
   const selectedModel =
     view.state.values.model_select?.model_choice?.selected_option?.value ||
     DEFAULT_MODEL;
+  const publishToCoda = getPublishToCodaValue(view.state.values);
+  const ddrTitle = (view.state.values.ddr_title?.title_input?.value || "").trim();
   const gatherErrors = {};
   if (containsVideoReference(additionalLinks)) {
     gatherErrors.additional_links =
@@ -450,6 +485,9 @@ app.view("gather_context_submit", async ({ ack, body, view, client }) => {
     gatherErrors.additional_notes =
       "Video links/uploads are not supported in this form.";
   }
+  if (publishToCoda && !ddrTitle) {
+    gatherErrors.ddr_title = "DDR Title is required when Publish to Coda is checked.";
+  }
   if (Object.keys(gatherErrors).length > 0) {
     await ack({ response_action: "errors", errors: gatherErrors });
     return;
@@ -457,10 +495,14 @@ app.view("gather_context_submit", async ({ ack, body, view, client }) => {
   console.log("[gather_context_submit] Submit received", {
     sessionId,
     selectedModel,
+    publishToCoda,
+    hasDdrTitle: Boolean(ddrTitle),
     hasAdditionalLinks: Boolean(additionalLinks.trim()),
     hasAdditionalNotes: Boolean(additionalNotes.trim()),
   });
   session.selectedModel = selectedModel;
+  session.publishToCoda = publishToCoda;
+  session.ddrTitle = ddrTitle;
 
   if (additionalLinks.trim()) {
     // Queue links so we can ack quickly, then fetch in background.
@@ -897,6 +939,197 @@ function getJobDownloadUrl(filename) {
   return `${process.env.PUBLIC_URL.replace(/\/$/, "")}/download/${filename}`;
 }
 
+function getDesignDecisionRecordsUrl() {
+  const docId = process.env.CODA_DOC_ID;
+  const tableId = process.env.CODA_TABLE_ID;
+  if (docId && tableId) {
+    return `https://coda.io/d/_d${docId}#_tu${tableId}`;
+  }
+  return DEFAULT_DESIGN_DECISION_RECORDS_URL;
+}
+
+function getPublishToCodaValue(viewStateValues) {
+  const selectedOptions =
+    viewStateValues.coda_publish?.publish_to_coda?.selected_options || [];
+  return selectedOptions.some((option) => option?.value === "publish");
+}
+
+function parseDdrMarkdown(markdown, fallbackTitle = "") {
+  const normalized = String(markdown || "").replace(/\r\n/g, "\n");
+  const titleMatch = normalized.match(/^#\s+(.+)$/m);
+  const markdownTitle = titleMatch
+    ? titleMatch[1].replace(/^Design Decision:\s*/i, "").trim()
+    : "";
+  const title = markdownTitle || String(fallbackTitle || "").trim() || "Untitled DDR";
+
+  const sectionHeadingPattern = /^##\s+(.+)$/gm;
+  const sections = {};
+  const headingMatches = [...normalized.matchAll(sectionHeadingPattern)];
+
+  for (let i = 0; i < headingMatches.length; i += 1) {
+    const current = headingMatches[i];
+    const heading = current[1].trim().toLowerCase();
+    const contentStart = current.index + current[0].length;
+    const contentEnd =
+      i + 1 < headingMatches.length ? headingMatches[i + 1].index : normalized.length;
+    const content = normalized.slice(contentStart, contentEnd).trim();
+    sections[heading] = content;
+  }
+
+  return {
+    title,
+    problem: sections.problem || "",
+    decision: sections.decision || "",
+    consequences: sections.consequences || "",
+    alternativesConsidered: sections["alternatives considered"] || "",
+    additionalContext: sections["additional context"] || "",
+  };
+}
+
+function getCodaHeaders() {
+  if (!process.env.CODA_API_TOKEN) {
+    throw new Error("CODA_API_TOKEN is not set");
+  }
+  return {
+    Authorization: `Bearer ${process.env.CODA_API_TOKEN}`,
+    "Content-Type": "application/json",
+  };
+}
+
+function getCodaTablePath() {
+  const docId = process.env.CODA_DOC_ID;
+  const tableId = process.env.CODA_TABLE_ID;
+  if (!docId || !tableId) {
+    throw new Error("CODA_DOC_ID and CODA_TABLE_ID must be set to publish to Coda");
+  }
+  return {
+    docId,
+    tableId,
+    tablePath: `docs/${encodeURIComponent(docId)}/tables/${encodeURIComponent(tableId)}`,
+  };
+}
+
+async function getCodaColumnMap() {
+  const { tablePath } = getCodaTablePath();
+  const cacheKey = tablePath;
+  if (codaColumnsCache.has(cacheKey)) {
+    return codaColumnsCache.get(cacheKey);
+  }
+
+  const response = await fetch(`${CODA_API_BASE}/${tablePath}/columns`, {
+    method: "GET",
+    headers: getCodaHeaders(),
+  });
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Coda columns lookup failed (${response.status}): ${body}`);
+  }
+
+  const payload = await response.json();
+  const map = new Map();
+  for (const column of payload.items || []) {
+    if (!column?.name || !column?.id) {
+      continue;
+    }
+    map.set(column.name.toLowerCase(), column.id);
+  }
+  codaColumnsCache.set(cacheKey, map);
+  return map;
+}
+
+function getRequiredCodaColumnId(columnMap, columnName) {
+  const candidateNames = CODA_COLUMN_ALIASES[columnName] || [columnName];
+  const columnId = candidateNames
+    .map((name) => columnMap.get(name.toLowerCase()))
+    .find(Boolean);
+  if (!columnId) {
+    throw new Error(
+      `Missing required Coda column: ${columnName} (accepted: ${candidateNames.join(", ")})`
+    );
+  }
+  return columnId;
+}
+
+async function publishToCoda(session, parsedSections) {
+  try {
+    const columnMap = await getCodaColumnMap();
+    const { docId, tableId, tablePath } = getCodaTablePath();
+    const today = new Date().toLocaleDateString("en-US");
+    const title = String(session.ddrTitle || parsedSections.title || "Untitled DDR").trim();
+
+    const cells = [
+      { column: getRequiredCodaColumnId(columnMap, "Title"), value: title },
+      {
+        column: getRequiredCodaColumnId(columnMap, "Author"),
+        value: session.initiatedBy || session.userId || "Unknown",
+      },
+      { column: getRequiredCodaColumnId(columnMap, "Status"), value: CODA_DEFAULT_STATUS },
+      { column: getRequiredCodaColumnId(columnMap, "Date Proposed"), value: today },
+      { column: getRequiredCodaColumnId(columnMap, "Problem"), value: parsedSections.problem },
+      { column: getRequiredCodaColumnId(columnMap, "Decision"), value: parsedSections.decision },
+      {
+        column: getRequiredCodaColumnId(columnMap, "Consequences"),
+        value: parsedSections.consequences,
+      },
+      {
+        column: getRequiredCodaColumnId(columnMap, "Alternatives Considered"),
+        value: parsedSections.alternativesConsidered,
+      },
+      {
+        column: getRequiredCodaColumnId(columnMap, "Additional Context"),
+        value: parsedSections.additionalContext,
+      },
+    ];
+
+    const insertResponse = await fetch(`${CODA_API_BASE}/${tablePath}/rows`, {
+      method: "POST",
+      headers: getCodaHeaders(),
+      body: JSON.stringify({
+        rows: [{ cells }],
+      }),
+    });
+    if (!insertResponse.ok) {
+      const body = await insertResponse.text();
+      throw new Error(`Coda row insert failed (${insertResponse.status}): ${body}`);
+    }
+
+    const insertPayload = await insertResponse.json();
+    const rowId = insertPayload?.addedRowIds?.[0];
+    if (!rowId) {
+      throw new Error("Coda row insert succeeded but no row ID was returned");
+    }
+    const fallbackRowUrl = `https://coda.io/d/_d${docId}/_su${tableId}#_ri${rowId}`;
+
+    const rowResponse = await fetch(
+      `${CODA_API_BASE}/${tablePath}/rows/${encodeURIComponent(rowId)}`,
+      {
+        method: "GET",
+        headers: getCodaHeaders(),
+      }
+    );
+    if (!rowResponse.ok) {
+      return {
+        success: true,
+        rowUrl: fallbackRowUrl,
+        error: null,
+      };
+    }
+    const rowPayload = await rowResponse.json();
+    return {
+      success: true,
+      rowUrl: rowPayload?.browserLink || fallbackRowUrl,
+      error: null,
+    };
+  } catch (err) {
+    console.error("[publishToCoda] Publish failed:", err);
+    return {
+      success: false,
+      rowUrl: null,
+      error: err?.message || String(err),
+    };
+  }
+}
+
 function createDdrJob(session, sessionId) {
   return {
     id: `ddr-${randomUUID()}`,
@@ -1124,12 +1357,22 @@ async function postRecoveryAction(client, job, detailsText) {
 async function postFinalDdrMessage(client, session, filename) {
   const baseText = `a ddr was created from this message (model: ${session.selectedModel || DEFAULT_MODEL})`;
   const downloadUrl = getJobDownloadUrl(filename);
-  const designDecisionRecordsUrl =
-    "https://coda.io/d/Design-system_d_JJUOCLqA5/Design-Decision-Records-DDRs_su5gqDzd#Decisions_tuMiWlSr";
-  const designDecisionRecordsLink = `<${designDecisionRecordsUrl}| 🔗 Go to Design Decision Records>`;
-  const channelText = downloadUrl
-    ? `${baseText}\n<${downloadUrl}| 💾 Download .md file>\n${designDecisionRecordsLink}`
-    : `${baseText}\n${designDecisionRecordsLink}`;
+  const codaRecordLink = session.codaRowUrl
+    ? `<${session.codaRowUrl}| 🔗 Link to record>`
+    : null;
+  const designDecisionRecordsLink = `<${getDesignDecisionRecordsUrl()}| 🔗 Go to Design Decision Records>`;
+  const fallbackLink = codaRecordLink || designDecisionRecordsLink;
+  const codaWarning = session.codaError
+    ? `:warning: Could not publish to Coda: ${session.codaError}`
+    : null;
+  const channelText = [
+    baseText,
+    downloadUrl ? `<${downloadUrl}| 💾 Download .md file>` : null,
+    fallbackLink,
+    codaWarning,
+  ]
+    .filter(Boolean)
+    .join("\n");
 
   if (session.origin === "slash") {
     await client.chat.postMessage({
@@ -1150,9 +1393,15 @@ async function postFinalDdrMessage(client, session, filename) {
     await client.chat.postMessage(postPayload);
   } catch (postErr) {
     console.warn("Could not post to channel, falling back to DM", postErr.message);
-    const dmText = downloadUrl
-      ? `Your DDR was created, but I couldn't post in the channel. <${downloadUrl}|💾 Download .md file>\n${designDecisionRecordsLink}`
-      : `Your DDR was created and saved, but I couldn't post the confirmation in the original channel because I haven't been added to it.\n${designDecisionRecordsLink}`;
+    const dmText = [
+      downloadUrl
+        ? `Your DDR was created, but I couldn't post in the channel. <${downloadUrl}|💾 Download .md file>`
+        : "Your DDR was created and saved, but I couldn't post the confirmation in the original channel because I haven't been added to it.",
+      fallbackLink,
+      codaWarning,
+    ]
+      .filter(Boolean)
+      .join("\n");
     await client.chat.postMessage({
       channel: session.userId,
       text: dmText,
@@ -1188,6 +1437,14 @@ async function executeDdrJob(job, client, options = {}) {
     writeFileSync(filepath, markdown);
     job.filename = filename;
     await persistJob(job);
+
+    if (session.publishToCoda) {
+      const parsed = parseDdrMarkdown(markdown, session.ddrTitle);
+      const codaResult = await publishToCoda(session, parsed);
+      session.codaRowUrl = codaResult.rowUrl;
+      session.codaError = codaResult.error;
+      await persistJob(job);
+    }
 
     await updateProgressMessage(client, job, "posting_result");
     await postFinalDdrMessage(client, session, filename);
@@ -1554,6 +1811,88 @@ Return ONLY a bullet list of 3-6 short questions, one question per line, each st
 }
 
 function buildDdrChooserModal(sessionId, metadata) {
+  const blocks = [
+    {
+      type: "input",
+      block_id: "chooser",
+      element: {
+        type: "radio_buttons",
+        action_id: "mode",
+        initial_option: {
+          text: {
+            type: "plain_text",
+            text: "Start from scratch",
+          },
+          value: "from_scratch",
+        },
+        options: [
+          {
+            text: {
+              type: "plain_text",
+              text: "Start from scratch",
+            },
+            value: "from_scratch",
+          },
+          {
+            text: {
+              type: "plain_text",
+              text: "From a Slack message",
+            },
+            value: "from_message",
+          },
+        ],
+      },
+      label: {
+        type: "plain_text",
+        text: "How would you like to start?",
+      },
+    },
+  ];
+
+  if (CODA_FEATURE_ENABLED) {
+    blocks.push(
+      {
+        type: "input",
+        block_id: "coda_publish",
+        optional: true,
+        element: {
+          type: "checkboxes",
+          action_id: "publish_to_coda",
+          options: [
+            {
+              text: {
+                type: "plain_text",
+                text: "Publish to Coda",
+              },
+              value: "publish",
+            },
+          ],
+        },
+        label: {
+          type: "plain_text",
+          text: "Coda",
+        },
+      },
+      {
+        type: "input",
+        block_id: "ddr_title",
+        optional: true,
+        element: {
+          type: "plain_text_input",
+          action_id: "title_input",
+          placeholder: {
+            type: "plain_text",
+            text: "Required if Publish to Coda is checked",
+          },
+        },
+        label: {
+          type: "plain_text",
+          text: "DDR Title",
+        },
+      }
+    );
+  }
+
   return {
     type: "modal",
     callback_id: "ddr_chooser_submit",
@@ -1570,43 +1909,7 @@ function buildDdrChooserModal(sessionId, metadata) {
       type: "plain_text",
       text: "Cancel",
     },
-    blocks: [
-      {
-        type: "input",
-        block_id: "chooser",
-        element: {
-          type: "radio_buttons",
-          action_id: "mode",
-          initial_option: {
-            text: {
-              type: "plain_text",
-              text: "Start from scratch",
-            },
-            value: "from_scratch",
-          },
-          options: [
-            {
-              text: {
-                type: "plain_text",
-                text: "Start from scratch",
-              },
-              value: "from_scratch",
-            },
-            {
-              text: {
-                type: "plain_text",
-                text: "From a Slack message",
-              },
-              value: "from_message",
-            },
-          ],
-        },
-        label: {
-          type: "plain_text",
-          text: "How would you like to start?",
-        },
-      },
-    ],
+    blocks,
   };
 }
 
@@ -1672,7 +1975,9 @@ function buildGatherContextModal(
   sourceMessages,
   additionalContext = [],
   selectedModel = DEFAULT_MODEL,
-  appNotInChannel = false
+  appNotInChannel = false,
+  publishToCoda = false,
+  ddrTitle = ""
 ) {
   const contextPreview =
     typeof sourceMessages === "string"
@@ -1750,6 +2055,62 @@ function buildGatherContextModal(
       },
     },
   ];
+
+  if (CODA_FEATURE_ENABLED) {
+    blocks.push(
+      {
+        type: "input",
+        block_id: "coda_publish",
+        optional: true,
+        element: {
+          type: "checkboxes",
+          action_id: "publish_to_coda",
+          initial_options: publishToCoda
+            ? [
+                {
+                  text: {
+                    type: "plain_text",
+                    text: "Publish to Coda",
+                  },
+                  value: "publish",
+                },
+              ]
+            : undefined,
+          options: [
+            {
+              text: {
+                type: "plain_text",
+                text: "Publish to Coda",
+              },
+              value: "publish",
+            },
+          ],
+        },
+        label: {
+          type: "plain_text",
+          text: "Coda",
+        },
+      },
+      {
+        type: "input",
+        block_id: "ddr_title",
+        optional: true,
+        element: {
+          type: "plain_text_input",
+          action_id: "title_input",
+          initial_value: ddrTitle,
+          placeholder: {
+            type: "plain_text",
+            text: "Required if Publish to Coda is checked",
+          },
+        },
+        label: {
+          type: "plain_text",
+          text: "DDR Title",
+        },
+      }
+    );
+  }
 
   if (appNotInChannel) {
     blocks.unshift(

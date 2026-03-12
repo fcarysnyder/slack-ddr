@@ -13,6 +13,8 @@ node_modules/
 .vscode/
 *.swp
 *.swo
+.coda_tables.json
+.coda_tables_summary.json
 
 # Optional: uncomment to ignore Cursor plans/state
 # .cursor/

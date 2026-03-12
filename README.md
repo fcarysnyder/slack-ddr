@@ -118,6 +118,12 @@ SLACK_APP_TOKEN=xapp-your-app-level-token
 ANTHROPIC_API_KEY=sk-ant-your-key
 # Optional but recommended for download links:
 PUBLIC_URL=https://your-hostname
+# Optional for Coda publishing:
+CODA_API_TOKEN=
+CODA_DOC_ID=
+CODA_TABLE_ID=
+# Optional; must match your Status options in Coda.
+CODA_DEFAULT_STATUS=Under Review
 ```
 
 ### 5. Run
@@ -131,6 +137,33 @@ npm run dev
 - Generated markdown files are saved in `data/` as `design-decision-<timestamp>.md`.
 - Job state is persisted in `data/jobs/` for recovery and `/ddr-jobs`.
 - If `PUBLIC_URL` is configured, Slack messages include a direct download link.
+
+## Coda API Setup
+
+1. Go to [coda.io/account](https://coda.io/account) and scroll to **API Settings**.
+2. Click **Generate API token**.
+3. Give it a name (for example, "DDR Slack Bot") and click **Generate**.
+4. Copy the token and set it as `CODA_API_TOKEN` in your environment.
+5. Open the Coda doc that contains your Design Decision Records table.
+6. Get the **Doc ID** from the URL: `https://coda.io/d/Your-Doc_d<DOC_ID>/...` (the part after `_d`).
+7. Get the **Table ID** from the URL after `_su`, or use the table name (for example, `Design Decision Records`).
+8. Set `CODA_DOC_ID` and `CODA_TABLE_ID` in your environment.
+
+If `CODA_API_TOKEN` is not set, Coda controls are hidden and DDR generation works as usual without publishing.
+
+Required Coda table columns:
+- Title (or `Name`)
+- Author
+- Status
+- Date proposed (or `Date Proposed`; `Date Created`/`Date created` also supported as fallback)
+- Problem
+- Decision
+- Consequences
+- Alternatives Considered
+- Additional Context
+
+The bot resolves Coda column IDs from these names and caches them for the running process.
+For Status, the default published value is `Under Review` (or `CODA_DEFAULT_STATUS` if set).
 
 ## Troubleshooting
 
