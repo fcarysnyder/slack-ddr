@@ -40,6 +40,7 @@ const DEFAULT_DESIGN_DECISION_RECORDS_URL =
   "https://coda.io/d/Design-system_d_JJUOCLqA5/Design-Decision-Records-DDRs_su5gqDzd#Decisions_tuMiWlSr";
 const CODA_FEATURE_ENABLED = Boolean(process.env.CODA_API_TOKEN);
 const CODA_DEFAULT_STATUS = process.env.CODA_DEFAULT_STATUS || "Under Review";
+const SLACK_DDR_ANNOUNCE_CHANNEL = (process.env.SLACK_DDR_ANNOUNCE_CHANNEL || "").trim();
 const CODA_COLUMN_ALIASES = {
   Title: ["Title", "Name"],
   "Date Proposed": ["Date Proposed", "Date proposed", "Date Created", "Date created"],
@@ -49,6 +50,7 @@ let modelOptionsCache = {
   options: [],
 };
 const codaColumnsCache = new Map();
+const slackChannelLookupCache = new Map();
 
 const THINKING_WORDS = [
   "thinking",
@@ -948,6 +950,64 @@ function getDesignDecisionRecordsUrl() {
   return DEFAULT_DESIGN_DECISION_RECORDS_URL;
 }
 
+function isSlackChannelId(value = "") {
+  return /^[CGD][A-Z0-9]+$/i.test(String(value || "").trim());
+}
+
+async function resolveAnnounceChannel(client) {
+  const configured = SLACK_DDR_ANNOUNCE_CHANNEL;
+  if (!configured) {
+    return null;
+  }
+
+  // Already an ID; no lookup needed.
+  if (isSlackChannelId(configured)) {
+    return configured;
+  }
+
+  const name = configured.replace(/^#/, "").trim().toLowerCase();
+  if (!name) {
+    return null;
+  }
+
+  if (slackChannelLookupCache.has(name)) {
+    return slackChannelLookupCache.get(name);
+  }
+
+  try {
+    let cursor;
+    let pageGuard = 0;
+    while (pageGuard < 20) {
+      const response = await client.conversations.list({
+        types: "public_channel,private_channel",
+        exclude_archived: true,
+        limit: 1000,
+        cursor,
+      });
+      const match = (response.channels || []).find(
+        (channel) => channel?.name?.toLowerCase() === name
+      );
+      if (match?.id) {
+        slackChannelLookupCache.set(name, match.id);
+        return match.id;
+      }
+      cursor = response.response_metadata?.next_cursor;
+      if (!cursor) {
+        break;
+      }
+      pageGuard += 1;
+    }
+  } catch (err) {
+    console.warn("[resolveAnnounceChannel] Failed channel lookup by name", {
+      configured,
+      message: err?.message,
+    });
+  }
+
+  // Fallback to configured raw value (for environments where #channel works directly).
+  return configured;
+}
+
 function getPublishToCodaValue(viewStateValues) {
   const selectedOptions =
     viewStateValues.coda_publish?.publish_to_coda?.selected_options || [];
@@ -984,6 +1044,84 @@ function parseDdrMarkdown(markdown, fallbackTitle = "") {
     alternativesConsidered: sections["alternatives considered"] || "",
     additionalContext: sections["additional context"] || "",
   };
+}
+
+function splitMarkdownTableRow(row) {
+  return String(row || "")
+    .trim()
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split("|")
+    .map((cell) => cell.trim());
+}
+
+function formatMarkdownTablesForCoda(text = "") {
+  const lines = String(text || "").replace(/\r\n/g, "\n").split("\n");
+  const out = [];
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const current = lines[i];
+    if (!current.trim().startsWith("|")) {
+      out.push(current);
+      continue;
+    }
+
+    const tableLines = [current];
+    let j = i + 1;
+    while (j < lines.length && lines[j].trim().startsWith("|")) {
+      tableLines.push(lines[j]);
+      j += 1;
+    }
+
+    const hasHeaderSeparator =
+      tableLines.length >= 2 &&
+      /^(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(tableLines[1].trim());
+
+    if (!hasHeaderSeparator) {
+      out.push(...tableLines);
+      i = j - 1;
+      continue;
+    }
+
+    const headers = splitMarkdownTableRow(tableLines[0]);
+    const bodyRows = tableLines.slice(2);
+    for (const bodyRow of bodyRows) {
+      const cells = splitMarkdownTableRow(bodyRow);
+      if (!cells.length) {
+        continue;
+      }
+      const primary = cells[0] || "Item";
+      const details = cells
+        .slice(1)
+        .map((value, idx) => {
+          const header = headers[idx + 1] || `Detail ${idx + 1}`;
+          return `${header}: ${value}`;
+        })
+        .join("; ");
+      out.push(details ? `- ${primary} - ${details}` : `- ${primary}`);
+    }
+
+    i = j - 1;
+  }
+
+  return out.join("\n");
+}
+
+function normalizeMarkdownForCoda(text = "") {
+  let normalized = formatMarkdownTablesForCoda(text);
+  normalized = normalized
+    // Remove markdown heading markers so table cells read naturally.
+    .replace(/^#{1,6}\s+/gm, "")
+    // Convert markdown links to readable text with URL.
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, "$1 ($2)")
+    // Keep content but strip common inline markdown markers.
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/^\*\s+/gm, "- ")
+    .replace(/^>\s?/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return normalized;
 }
 
 function getCodaHeaders() {
@@ -1056,28 +1194,33 @@ async function publishToCoda(session, parsedSections) {
     const { docId, tableId, tablePath } = getCodaTablePath();
     const today = new Date().toLocaleDateString("en-US");
     const title = String(session.ddrTitle || parsedSections.title || "Untitled DDR").trim();
+    const problem = normalizeMarkdownForCoda(parsedSections.problem);
+    const decision = normalizeMarkdownForCoda(parsedSections.decision);
+    const consequences = normalizeMarkdownForCoda(parsedSections.consequences);
+    const alternativesConsidered = normalizeMarkdownForCoda(parsedSections.alternativesConsidered);
+    const additionalContext = normalizeMarkdownForCoda(parsedSections.additionalContext);
 
     const cells = [
       { column: getRequiredCodaColumnId(columnMap, "Title"), value: title },
       {
         column: getRequiredCodaColumnId(columnMap, "Author"),
-        value: session.initiatedBy || session.userId || "Unknown",
+        value: "",
       },
       { column: getRequiredCodaColumnId(columnMap, "Status"), value: CODA_DEFAULT_STATUS },
       { column: getRequiredCodaColumnId(columnMap, "Date Proposed"), value: today },
-      { column: getRequiredCodaColumnId(columnMap, "Problem"), value: parsedSections.problem },
-      { column: getRequiredCodaColumnId(columnMap, "Decision"), value: parsedSections.decision },
+      { column: getRequiredCodaColumnId(columnMap, "Problem"), value: problem },
+      { column: getRequiredCodaColumnId(columnMap, "Decision"), value: decision },
       {
         column: getRequiredCodaColumnId(columnMap, "Consequences"),
-        value: parsedSections.consequences,
+        value: consequences,
       },
       {
         column: getRequiredCodaColumnId(columnMap, "Alternatives Considered"),
-        value: parsedSections.alternativesConsidered,
+        value: alternativesConsidered,
       },
       {
         column: getRequiredCodaColumnId(columnMap, "Additional Context"),
-        value: parsedSections.additionalContext,
+        value: additionalContext,
       },
     ];
 
@@ -1355,7 +1498,10 @@ async function postRecoveryAction(client, job, detailsText) {
 }
 
 async function postFinalDdrMessage(client, session, filename) {
-  const baseText = `a ddr was created from this message (model: ${session.selectedModel || DEFAULT_MODEL})`;
+  const createdByText = session.userId ? `<@${session.userId}>` : "unknown user";
+  const baseText = `A DDR was created from this message by ${createdByText} (model: ${
+    session.selectedModel || DEFAULT_MODEL
+  })`;
   const downloadUrl = getJobDownloadUrl(filename);
   const codaRecordLink = session.codaRowUrl
     ? `<${session.codaRowUrl}| 🔗 Link to record>`
@@ -1373,6 +1519,22 @@ async function postFinalDdrMessage(client, session, filename) {
   ]
     .filter(Boolean)
     .join("\n");
+
+  const configuredAnnounceChannel = await resolveAnnounceChannel(client);
+  if (configuredAnnounceChannel) {
+    try {
+      await client.chat.postMessage({
+        channel: configuredAnnounceChannel,
+        text: channelText,
+      });
+      return;
+    } catch (postErr) {
+      console.warn(
+        "[postFinalDdrMessage] Could not post to configured announce channel",
+        postErr.message
+      );
+    }
+  }
 
   if (session.origin === "slash") {
     await client.chat.postMessage({
@@ -1642,9 +1804,7 @@ async function synthesizeDecision(session) {
   const allContext = [
     sourceLabel,
     session.sourceMessages,
-    `--- Decision Metadata Defaults ---\nAuthor: ${
-      session.initiatedBy || session.userId
-    }\nStatus: Proposed\nDate proposed: ${dateProposed}\nDate approved: (leave blank by default)`,
+    `--- Decision Metadata Defaults ---\nAuthor: (leave blank)\nStatus: Proposed\nDate proposed: ${dateProposed}\nDate approved: (leave blank by default)`,
     ...session.additionalContext,
   ].join("\n\n");
 
@@ -1665,7 +1825,7 @@ Output the decision log in this exact markdown format:
 
 # Design Decision: [Short Title]
 
-**Author:** [who initiated this app flow]
+**Author:**
 **Status:** Proposed
 **Date proposed:** [today's date]
 **Date approved:**
@@ -1708,7 +1868,6 @@ Output the decision log in this exact markdown format:
   });
 
   return applyDecisionHeaderDefaults(response.content[0].text, {
-    author: session.initiatedBy || session.userId || "Unknown",
     dateProposed,
   });
 }
@@ -1731,7 +1890,7 @@ function applyDecisionHeaderDefaults(markdown, metadata) {
   return [
     title,
     "",
-    `**Author:** ${metadata.author}`,
+    "**Author:**",
     "**Status:** Proposed",
     `**Date proposed:** ${metadata.dateProposed}`,
     "**Date approved:**",

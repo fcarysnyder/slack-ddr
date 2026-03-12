@@ -87,7 +87,9 @@ Add OAuth scopes:
 2. Add bot scopes:
    - `chat:write`
    - `channels:history`
+   - `channels:read` (optional; needed when `SLACK_DDR_ANNOUNCE_CHANNEL` is set by `#channel-name`)
    - `groups:history`
+   - `groups:read` (optional; needed when announce channel is a private `#channel-name`)
    - `im:write`
    - `users:read`
    - `commands`
@@ -118,6 +120,9 @@ SLACK_APP_TOKEN=xapp-your-app-level-token
 ANTHROPIC_API_KEY=sk-ant-your-key
 # Optional but recommended for download links:
 PUBLIC_URL=https://your-hostname
+# Optional: route final "DDR created" announcements to one channel.
+# Use channel ID (recommended) or #channel-name.
+SLACK_DDR_ANNOUNCE_CHANNEL=
 # Optional for Coda publishing:
 CODA_API_TOKEN=
 CODA_DOC_ID=
@@ -137,6 +142,7 @@ npm run dev
 - Generated markdown files are saved in `data/` as `design-decision-<timestamp>.md`.
 - Job state is persisted in `data/jobs/` for recovery and `/ddr-jobs`.
 - If `PUBLIC_URL` is configured, Slack messages include a direct download link.
+- If `SLACK_DDR_ANNOUNCE_CHANNEL` is set, final DDR completion messages are posted there.
 
 ## Coda API Setup
 
