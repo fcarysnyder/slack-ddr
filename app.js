@@ -50,7 +50,26 @@ const CODA_COLUMN_ALIASES = {
   Title: ["Title", "Name"],
   "Date Proposed": ["Date Proposed", "Date proposed", "Date Created", "Date created"],
   "Date Created": ["Date Created", "Date created"],
+  "Slack References": [
+    "Slack References",
+    "Slack Links",
+    "Messages added from Slack",
+    "Slack URLs",
+  ],
 };
+const SUPPORTED_IMAGE_MIME_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/jpg",
+  "image/webp",
+  "image/gif",
+]);
+const MAX_MODEL_IMAGES = Number(process.env.MAX_MODEL_IMAGES || 6);
+const MAX_MODEL_IMAGE_BYTES = Number(process.env.MAX_MODEL_IMAGE_BYTES || 5 * 1024 * 1024);
+const MAX_MODEL_IMAGE_TOTAL_BYTES = Number(
+  process.env.MAX_MODEL_IMAGE_TOTAL_BYTES || 20 * 1024 * 1024
+);
+const SLACK_URL_PATTERN = /https:\/\/[^\s>]*slack\.com\/[^\s>)\]}]+/gi;
 let modelOptionsCache = {
   fetchedAt: 0,
   options: [],
@@ -318,6 +337,8 @@ app.view("chooser_submit", async ({ ack, view, client }) => {
     threadTs: undefined,
     sourceMessages: "",
     additionalContext: [],
+    slackReferences: [],
+    slackImageCandidates: [],
     pendingLinkInputs: [],
     clarifyingQuestions: [],
     selectedModel: DEFAULT_MODEL,
@@ -405,6 +426,8 @@ app.view("shortcut_document_type_submit", async ({ ack, view, client }) => {
     threadTs: pendingContext.threadTs,
     sourceMessages: pendingContext.sourceMessages,
     additionalContext: [],
+    slackReferences: pendingContext.slackReferences || [],
+    slackImageCandidates: pendingContext.slackImageCandidates || [],
     pendingLinkInputs: [],
     clarifyingQuestions: [],
     selectedModel: DEFAULT_MODEL,
@@ -500,6 +523,7 @@ app.view("gather_context_submit", async ({ ack, body, view, client }) => {
   });
   session.selectedModel = selectedModel;
   session.publishToCoda = publishToCoda;
+  ensureSessionSlackCollections(session);
   if (isOdc) {
     session.odcTitle = effectiveTitle;
   } else {
@@ -509,6 +533,20 @@ app.view("gather_context_submit", async ({ ack, body, view, client }) => {
   if (additionalLinks.trim()) {
     // Queue links so we can ack quickly, then fetch in background.
     session.pendingLinkInputs.push(additionalLinks.trim());
+  }
+
+  const manualSlackLinks = extractSlackUrls(
+    [additionalLinks, additionalNotes].filter(Boolean).join("\n")
+  );
+  if (manualSlackLinks.length > 0) {
+    session.slackReferences = dedupeSlackReferences([
+      ...session.slackReferences,
+      ...manualSlackLinks.map((url) => ({
+        url,
+        label: "Slack link from user-provided context",
+        source: "manual_input",
+      })),
+    ]);
   }
 
   if (additionalNotes.trim()) {
@@ -539,12 +577,20 @@ app.view("gather_context_submit", async ({ ack, body, view, client }) => {
           sessionId,
           inputLength: linkInput.length,
         });
-        const fetchedMessages = await withTimeout(
+        const fetchedContext = await withTimeout(
           fetchLinkedMessages(linkInput, client),
           15000,
           "linked message fetch timed out"
         );
-        session.additionalContext.push(...fetchedMessages);
+        session.additionalContext.push(...fetchedContext.contextChunks);
+        session.slackReferences = dedupeSlackReferences([
+          ...session.slackReferences,
+          ...fetchedContext.references,
+        ]);
+        session.slackImageCandidates = dedupeSlackImageCandidates([
+          ...session.slackImageCandidates,
+          ...fetchedContext.imageCandidates,
+        ]);
       }
     }
 
@@ -1461,11 +1507,20 @@ function getRequiredCodaColumnId(columnMap, columnName) {
   return columnId;
 }
 
+function getOptionalCodaColumnId(columnMap, columnName) {
+  const candidateNames = CODA_COLUMN_ALIASES[columnName] || [columnName];
+  return candidateNames
+    .map((name) => columnMap.get(name.toLowerCase()))
+    .find(Boolean);
+}
+
 async function publishToCoda(session, parsedSections, documentType = DOCUMENT_TYPES.DDR) {
   try {
     const columnMap = await getCodaColumnMap(documentType);
     const { docId, tableId, tablePath } = getCodaTablePath(documentType);
     const today = new Date().toLocaleDateString("en-US");
+    const slackReferencesValue = formatSlackReferencesForCoda(session?.slackReferences || []);
+    const slackReferencesColumn = getOptionalCodaColumnId(columnMap, "Slack References");
     const cells =
       documentType === DOCUMENT_TYPES.ODC
         ? [
@@ -1501,6 +1556,14 @@ async function publishToCoda(session, parsedSections, documentType = DOCUMENT_TY
               column: getRequiredCodaColumnId(columnMap, "Status"),
               value: parsedSections.status || session.odcStatus || "Open",
             },
+            ...(slackReferencesColumn && slackReferencesValue
+              ? [
+                  {
+                    column: slackReferencesColumn,
+                    value: slackReferencesValue,
+                  },
+                ]
+              : []),
           ]
         : [
             {
@@ -1535,6 +1598,14 @@ async function publishToCoda(session, parsedSections, documentType = DOCUMENT_TY
               column: getRequiredCodaColumnId(columnMap, "Additional Context"),
               value: normalizeMarkdownForCoda(parsedSections.additionalContext),
             },
+            ...(slackReferencesColumn && slackReferencesValue
+              ? [
+                  {
+                    column: slackReferencesColumn,
+                    value: slackReferencesValue,
+                  },
+                ]
+              : []),
           ];
 
     const insertResponse = await fetch(`${CODA_API_BASE}/${tablePath}/rows`, {
@@ -2034,7 +2105,7 @@ async function openShortcutTypeChooser(shortcut, client, initialType = DOCUMENT_
     messages = [shortcut.message];
   }
 
-  const formattedMessages = await formatMessages(messages, client);
+  const formatted = await formatMessages(messages, client, { channelId });
   const initiatedBy = await resolveUserName(shortcut.user.id, client);
   const sessionId = triggerId;
   pendingShortcutContexts.set(sessionId, {
@@ -2043,25 +2114,30 @@ async function openShortcutTypeChooser(shortcut, client, initialType = DOCUMENT_
     initiatedBy,
     sourceMessageTs: messageTs,
     threadTs: shortcut.message?.thread_ts || messageTs,
-    sourceMessages: formattedMessages,
+    sourceMessages: formatted.text,
+    slackReferences: formatted.references,
+    slackImageCandidates: formatted.imageCandidates,
     appNotInChannel,
   });
 
   await client.views.open({
     trigger_id: triggerId,
     view: buildShortcutDocumentTypeChooserModal(sessionId, {
-      sourceMessages: formattedMessages,
+      sourceMessages: formatted.text,
       appNotInChannel,
       initialType,
     }),
   });
 }
 
-async function formatMessages(messages, client) {
+async function formatMessages(messages, client, options = {}) {
+  const { channelId = null } = options;
   // Resolve user IDs to names for readability
   const userCache = new Map();
-
+  const references = [];
+  const imageCandidates = [];
   const formatted = [];
+
   for (const msg of messages) {
     let userName = msg.user || "Unknown";
     if (msg.user && !userCache.has(msg.user)) {
@@ -2078,10 +2154,58 @@ async function formatMessages(messages, client) {
     userName = userCache.get(msg.user) || userName;
 
     const time = new Date(parseFloat(msg.ts) * 1000).toLocaleString();
-    formatted.push(`[${time}] ${userName}: ${msg.text}`);
+    const text = String(msg.text || "").trim();
+    const files = Array.isArray(msg.files) ? msg.files : [];
+    const fileSummary = files
+      .map((file) => {
+        const type = file?.mimetype || "unknown";
+        const name = file?.name || "unnamed file";
+        return `${name} (${type})`;
+      })
+      .join(", ");
+    formatted.push(
+      fileSummary
+        ? `[${time}] ${userName}: ${text}\n  Files: ${fileSummary}`
+        : `[${time}] ${userName}: ${text}`
+    );
+
+    const textUrls = extractSlackUrls(text);
+    references.push(
+      ...textUrls.map((url) => ({
+        url,
+        label: `Message link from ${channelId || "unknown channel"}`,
+        source: "message_text",
+      }))
+    );
+
+    for (const file of files) {
+      const fileUrl = file?.permalink || file?.url_private || file?.url_private_download;
+      if (fileUrl) {
+        references.push({
+          url: fileUrl,
+          label: `File from ${channelId || "unknown channel"}`,
+          source: "message_file",
+        });
+      }
+      if (isSlackImageFile(file)) {
+        imageCandidates.push({
+          fileId: file.id || null,
+          name: file.name || "Slack image",
+          mimetype: file.mimetype,
+          urlPrivateDownload: file.url_private_download || file.url_private || null,
+          permalink: file.permalink || file.url_private || null,
+          channelId: channelId || null,
+          ts: msg.ts || null,
+        });
+      }
+    }
   }
 
-  return formatted.join("\n");
+  return {
+    text: formatted.join("\n"),
+    references: dedupeSlackReferences(references),
+    imageCandidates: dedupeSlackImageCandidates(imageCandidates),
+  };
 }
 
 async function fetchLinkedMessages(linksText, client) {
@@ -2089,11 +2213,19 @@ async function fetchLinkedMessages(linksText, client) {
   // https://workspace.slack.com/archives/C01234/p1234567890123456
   const linkPattern =
     /https:\/\/[^/]+\/archives\/([A-Z0-9]+)\/p(\d+)/g;
-  const results = [];
+  const contextChunks = [];
+  const references = [];
+  const imageCandidates = [];
 
   let match;
   while ((match = linkPattern.exec(linksText)) !== null) {
     const channelId = match[1];
+    const sourceUrl = match[0];
+    references.push({
+      url: sourceUrl,
+      label: `Linked Slack message from ${channelId}`,
+      source: "linked_input",
+    });
     // Slack encodes ts as digits without the dot; insert it back
     const rawTs = match[2];
     const ts = rawTs.slice(0, 10) + "." + rawTs.slice(10);
@@ -2111,18 +2243,100 @@ async function fetchLinkedMessages(linksText, client) {
       );
 
       if (threadResult.messages?.length) {
-        const formatted = await formatMessages(threadResult.messages, client);
-        results.push(`\n--- Linked Thread ---\n${formatted}`);
+        const formatted = await formatMessages(threadResult.messages, client, {
+          channelId,
+        });
+        contextChunks.push(`\n--- Linked Thread ---\n${formatted.text}`);
+        references.push(...formatted.references);
+        imageCandidates.push(...formatted.imageCandidates);
       }
     } catch (err) {
       console.error(`Could not fetch linked message: ${err.message}`);
-      results.push(
+      contextChunks.push(
         `\n--- Could not fetch linked message (channel: ${channelId}, ts: ${ts}) ---`
       );
     }
   }
 
-  return results;
+  return {
+    contextChunks,
+    references: dedupeSlackReferences(references),
+    imageCandidates: dedupeSlackImageCandidates(imageCandidates),
+  };
+}
+
+function ensureSessionSlackCollections(session) {
+  if (!Array.isArray(session.slackReferences)) {
+    session.slackReferences = [];
+  }
+  if (!Array.isArray(session.slackImageCandidates)) {
+    session.slackImageCandidates = [];
+  }
+}
+
+function extractSlackUrls(text = "") {
+  if (!text) {
+    return [];
+  }
+  const matches = String(text).match(SLACK_URL_PATTERN) || [];
+  return [...new Set(matches.map((url) => cleanDetectedUrl(url)).filter(Boolean))];
+}
+
+function cleanDetectedUrl(url = "") {
+  return String(url || "")
+    .trim()
+    .replace(/\|[^>]*$/g, "")
+    .replace(/[)>.,;!?]+$/g, "");
+}
+
+function dedupeSlackReferences(references = []) {
+  const map = new Map();
+  for (const ref of references) {
+    const url = cleanDetectedUrl(ref?.url || "");
+    if (!url) {
+      continue;
+    }
+    const key = url.toLowerCase();
+    if (map.has(key)) {
+      continue;
+    }
+    map.set(key, {
+      url,
+      label: ref?.label || "Slack reference",
+      source: ref?.source || "unknown",
+    });
+  }
+  return [...map.values()];
+}
+
+function dedupeSlackImageCandidates(candidates = []) {
+  const map = new Map();
+  for (const candidate of candidates) {
+    const url = cleanDetectedUrl(candidate?.urlPrivateDownload || "");
+    const fileId = String(candidate?.fileId || "").trim();
+    const key = fileId || url.toLowerCase();
+    if (!key || map.has(key)) {
+      continue;
+    }
+    map.set(key, {
+      ...candidate,
+      urlPrivateDownload: url,
+    });
+  }
+  return [...map.values()];
+}
+
+function isSlackImageFile(file) {
+  const mimetype = String(file?.mimetype || "").toLowerCase();
+  return SUPPORTED_IMAGE_MIME_TYPES.has(mimetype);
+}
+
+function normalizeAnthropicImageMimeType(mimetype = "") {
+  const normalized = String(mimetype || "").toLowerCase();
+  if (normalized === "image/jpg") {
+    return "image/jpeg";
+  }
+  return normalized;
 }
 
 async function withTimeout(promise, timeoutMs, timeoutMessage) {
@@ -2187,9 +2401,111 @@ function containsVideoReference(text = "") {
     return false;
   }
 
-  const videoPattern =
-    /(\.(mp4|mov|avi|mkv|webm|m4v|wmv|flv)(\?|$))|(files\.slack\.com)/i;
+  const videoPattern = /(\.(mp4|mov|avi|mkv|webm|m4v|wmv|flv)(\?|$))/i;
   return videoPattern.test(text);
+}
+
+function buildSlackReferencesContext(references = []) {
+  const deduped = dedupeSlackReferences(references);
+  if (deduped.length === 0) {
+    return "";
+  }
+  const lines = ["--- Messages Added from Slack ---"];
+  for (let index = 0; index < deduped.length; index += 1) {
+    const item = deduped[index];
+    lines.push(`${index + 1}. ${item.label}: ${item.url}`);
+  }
+  return lines.join("\n");
+}
+
+function formatSlackReferencesForCoda(references = []) {
+  const deduped = dedupeSlackReferences(references);
+  if (deduped.length === 0) {
+    return "";
+  }
+  return deduped
+    .map((item, index) => `${index + 1}. ${item.label} - ${item.url}`)
+    .join("\n");
+}
+
+async function buildSlackImageBlocks(session) {
+  const imageCandidates = dedupeSlackImageCandidates(session?.slackImageCandidates || []);
+  if (imageCandidates.length === 0) {
+    return [];
+  }
+  const botToken = process.env.SLACK_BOT_TOKEN;
+  if (!botToken) {
+    console.warn("[buildSlackImageBlocks] SLACK_BOT_TOKEN missing; skipping images");
+    return [];
+  }
+
+  const blocks = [];
+  let totalBytes = 0;
+  for (const candidate of imageCandidates) {
+    if (blocks.length >= MAX_MODEL_IMAGES) {
+      break;
+    }
+    const url = candidate?.urlPrivateDownload;
+    if (!url) {
+      continue;
+    }
+    try {
+      const response = await fetch(url, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${botToken}`,
+        },
+      });
+      if (!response.ok) {
+        console.warn("[buildSlackImageBlocks] Slack image fetch failed", {
+          status: response.status,
+          url: candidate?.permalink || url,
+        });
+        continue;
+      }
+      const buffer = Buffer.from(await response.arrayBuffer());
+      if (buffer.length > MAX_MODEL_IMAGE_BYTES) {
+        console.warn("[buildSlackImageBlocks] Skipping oversized image", {
+          bytes: buffer.length,
+          max: MAX_MODEL_IMAGE_BYTES,
+          url: candidate?.permalink || url,
+        });
+        continue;
+      }
+      if (totalBytes + buffer.length > MAX_MODEL_IMAGE_TOTAL_BYTES) {
+        console.warn("[buildSlackImageBlocks] Reached total image byte cap", {
+          totalBytes,
+          nextBytes: buffer.length,
+          max: MAX_MODEL_IMAGE_TOTAL_BYTES,
+        });
+        break;
+      }
+      totalBytes += buffer.length;
+      blocks.push({
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: normalizeAnthropicImageMimeType(candidate.mimetype),
+          data: buffer.toString("base64"),
+        },
+      });
+    } catch (err) {
+      console.warn("[buildSlackImageBlocks] Failed to process Slack image", {
+        message: err.message,
+        url: candidate?.permalink || candidate?.urlPrivateDownload || null,
+      });
+    }
+  }
+
+  return blocks;
+}
+
+async function buildAnthropicUserContent(textContext, session) {
+  const imageBlocks = await buildSlackImageBlocks(session);
+  if (imageBlocks.length === 0) {
+    return textContext;
+  }
+  return [{ type: "text", text: textContext }, ...imageBlocks];
 }
 
 async function synthesizeDocument(session) {
@@ -2202,12 +2518,18 @@ async function synthesizeDocument(session) {
 async function synthesizeDecisionRecord(session) {
   const dateProposed = new Date().toLocaleDateString("en-US");
   const sourceLabel = session.sourceMessageTs ? "--- Original Thread/Message ---" : "--- User-Provided Context ---";
+  const slackReferencesContext = buildSlackReferencesContext(session.slackReferences);
   const allContext = [
     sourceLabel,
     session.sourceMessages,
     `--- Decision Metadata Defaults ---\nAuthor: (leave blank)\nStatus: Proposed\nDate proposed: ${dateProposed}\nDate approved: (leave blank by default)`,
+    ...(slackReferencesContext ? [slackReferencesContext] : []),
     ...session.additionalContext,
   ].join("\n\n");
+  const userContent = await buildAnthropicUserContent(
+    `Here is the Slack conversation and additional context. Please synthesize this into a design decision log.\n\n${allContext}`,
+    session
+  );
 
   const response = await anthropic.messages.create({
     model: session.selectedModel || DEFAULT_MODEL,
@@ -2263,7 +2585,7 @@ Output the decision log in this exact markdown format:
     messages: [
       {
         role: "user",
-        content: `Here is the Slack conversation and additional context. Please synthesize this into a design decision log.\n\n${allContext}`,
+        content: userContent,
       },
     ],
   });
@@ -2278,14 +2600,20 @@ async function synthesizeOpenDesignChallenge(session) {
   const sourceLabel = session.sourceMessageTs
     ? "--- Original Thread/Message ---"
     : "--- User-Provided Context ---";
+  const slackReferencesContext = buildSlackReferencesContext(session.slackReferences);
   const allContext = [
     sourceLabel,
     session.sourceMessages,
     `--- ODC Metadata ---\nChallenge: ${session.odcTitle || "Untitled ODC"}\nStatus: ${
       session.odcStatus || "Open"
     }\nDate: ${dateRaised}\nRaised by: ${session.initiatedBy || "Unknown"}`,
+    ...(slackReferencesContext ? [slackReferencesContext] : []),
     ...session.additionalContext,
   ].join("\n\n");
+  const userContent = await buildAnthropicUserContent(
+    `Generate an Open Design Challenge markdown document from this context:\n\n${allContext}`,
+    session
+  );
 
   const response = await anthropic.messages.create({
     model: session.selectedModel || DEFAULT_MODEL,
@@ -2330,7 +2658,7 @@ Output in this exact markdown format:
     messages: [
       {
         role: "user",
-        content: `Generate an Open Design Challenge markdown document from this context:\n\n${allContext}`,
+        content: userContent,
       },
     ],
   });
@@ -2448,9 +2776,11 @@ async function resolveUserName(userId, client) {
 
 async function generateClarifyingQuestions(session) {
   const sourceLabel = session.sourceMessageTs ? "--- Original Thread/Message ---" : "--- User-Provided Context ---";
+  const slackReferencesContext = buildSlackReferencesContext(session.slackReferences);
   const context = [
     sourceLabel,
     session.sourceMessages,
+    ...(slackReferencesContext ? [slackReferencesContext] : []),
     ...session.additionalContext,
   ].join("\n\n");
 

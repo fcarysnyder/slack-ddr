@@ -51,6 +51,7 @@ What this app does:
 
 Notes:
 - Text-only context in modal inputs (video links/uploads are rejected in those fields)
+- Existing Slack thread images/files can be referenced automatically; no new file uploads are required in the modal flow
 - The app must be in the channel to read full thread context and post there
 ```
 
@@ -167,6 +168,7 @@ Add OAuth scopes:
    - `im:write`
    - `users:read`
    - `commands`
+   - `files:read` (required to analyze existing Slack image attachments)
 
 Install app:
 1. Go to **Settings > Install App**.
@@ -221,6 +223,8 @@ npm run dev
 - Job state is persisted in `data/jobs/` for recovery and `/ddr-jobs`.
 - If `PUBLIC_URL` is configured, Slack messages include a direct download link.
 - If `SLACK_DDR_ANNOUNCE_CHANNEL` is set, final DDR completion messages are posted there.
+- Anthropic synthesis can include existing Slack images from source/linked threads (when file access permits).
+- Coda publishing stays link-only for Slack references; image binaries are not uploaded to Coda.
 
 ## Coda API Setup
 
@@ -244,6 +248,7 @@ Required Coda table columns (DDR):
 - Consequences
 - Alternatives Considered
 - Additional Context
+- Slack References (optional; if present, receives deduped Slack links used during generation)
 
 Required Coda table columns (ODC):
 - Title (or `Name`)
@@ -254,6 +259,7 @@ Required Coda table columns (ODC):
 - Cost of No Action
 - Additional Context
 - Status
+- Slack References (optional; if present, receives deduped Slack links used during generation)
 
 The bot resolves Coda column IDs from these names and caches them for the running process.
 For DDR Status, the default published value is `Under Review` (or `CODA_DEFAULT_STATUS` if set).
