@@ -648,6 +648,7 @@ app.view("clarifying_submit", async ({ ack, view, client }) => {
   const questions = session.clarifyingQuestions || [];
   const clarifyingErrors = {};
   const qaLines = [];
+  const structuredAnswers = {};
 
   questions.forEach((question, index) => {
     const blockId = `clarifying_q_${index}`;
@@ -661,6 +662,7 @@ app.view("clarifying_submit", async ({ ack, view, client }) => {
 
     if (answer) {
       qaLines.push(`- Q: ${question}\n  A: ${answer}`);
+      structuredAnswers[question] = answer;
     }
   });
 
@@ -668,6 +670,8 @@ app.view("clarifying_submit", async ({ ack, view, client }) => {
     await ack({ response_action: "errors", errors: clarifyingErrors });
     return;
   }
+
+  session.clarifyingAnswers = structuredAnswers;
 
   if (qaLines.length > 0) {
     session.additionalContext.push(
@@ -793,6 +797,72 @@ app.action("resume_odc_job", async ({ ack, body, action, client }) => {
   await executeDdrJob(job, client, { resumedBy: body.user.id });
 });
 
+// ─── Action: Restart DDR/ODC with pre-filled answers ─────────────
+async function handleRestartJob(ack, body, action, client, documentType) {
+  await ack();
+  const jobId = action?.value;
+  if (!jobId) return;
+
+  const isOdc = documentType === DOCUMENT_TYPES.ODC;
+  const noun = isOdc ? "ODC" : "DDR";
+  const channelId = body.channel?.id;
+
+  const job = loadJob(jobId);
+  if (!job) {
+    await safePostEphemeralOrDM(client, channelId, body.user.id,
+      `:warning: I couldn't find job \`${jobId}\` to restart.`);
+    return;
+  }
+  if (!job.session) {
+    await safePostEphemeralOrDM(client, channelId, body.user.id,
+      `:x: Job \`${jobId}\` has no session data and cannot be restarted.`);
+    return;
+  }
+
+  const oldSession = job.session;
+  const previousAnswers = getJobClarifyingAnswers(job);
+  const questions = oldSession.clarifyingQuestions || [];
+
+  const sessionId = randomUUID();
+  const newSession = {
+    ...JSON.parse(JSON.stringify(oldSession)),
+    additionalContext: (oldSession.additionalContext || []).filter(
+      (ctx) => !ctx.includes("--- Clarifying Questions Asked & Answers ---")
+    ),
+    clarifyingQuestions: questions,
+    clarifyingAnswers: {},
+    createdAt: Date.now(),
+  };
+  sessions.set(sessionId, newSession);
+
+  try {
+    await client.views.open({
+      trigger_id: body.trigger_id,
+      view: buildClarifyingQuestionsModal(
+        sessionId,
+        newSession.sourceMessages,
+        questions,
+        newSession.additionalContext,
+        newSession.documentType,
+        previousAnswers
+      ),
+    });
+  } catch (err) {
+    console.error(`[restart_${noun.toLowerCase()}_job] Failed to open modal:`, err);
+    sessions.delete(sessionId);
+    await safePostEphemeralOrDM(client, channelId, body.user.id,
+      `:x: Failed to open the restart modal for \`${jobId}\`. Please try again.`);
+  }
+}
+
+app.action("restart_ddr_job", async ({ ack, body, action, client }) => {
+  await handleRestartJob(ack, body, action, client, DOCUMENT_TYPES.DDR);
+});
+
+app.action("restart_odc_job", async ({ ack, body, action, client }) => {
+  await handleRestartJob(ack, body, action, client, DOCUMENT_TYPES.ODC);
+});
+
 async function safePostEphemeralOrDM(client, channelId, userId, text) {
   try {
     await client.chat.postEphemeral({
@@ -892,6 +962,8 @@ function buildJobsPayload(jobs, context) {
   const idHint = isOdc ? "odc-<id>" : "ddr-<id>";
   const resumeActionId = isOdc ? "resume_odc_job" : "resume_ddr_job";
   const resumeButtonText = isOdc ? "Resume ODC generation" : "Resume DDR generation";
+  const restartActionId = isOdc ? "restart_odc_job" : "restart_ddr_job";
+  const restartButtonText = `Restart ${noun}`;
   const statusText = query.status ? `status=${query.status}` : "status=any";
   const scopeText = query.scope === "all" ? "scope=all" : "scope=mine";
   const titleText = `Showing ${jobs.length} job(s) (${scopeText}, ${statusText}, limit=${query.limit})`;
@@ -953,22 +1025,26 @@ function buildJobsPayload(jobs, context) {
       },
     });
 
+    const actionButtons = [];
     if (job.status === "failed") {
-      blocks.push({
-        type: "actions",
-        elements: [
-          {
-            type: "button",
-            action_id: resumeActionId,
-            text: {
-              type: "plain_text",
-              text: resumeButtonText,
-            },
-            style: "primary",
-            value: job.id,
-          },
-        ],
+      actionButtons.push({
+        type: "button",
+        action_id: resumeActionId,
+        text: { type: "plain_text", text: resumeButtonText },
+        style: "primary",
+        value: job.id,
       });
+    }
+    if ((job.status === "failed" || job.status === "completed") && job.session) {
+      actionButtons.push({
+        type: "button",
+        action_id: restartActionId,
+        text: { type: "plain_text", text: restartButtonText },
+        value: job.id,
+      });
+    }
+    if (actionButtons.length > 0) {
+      blocks.push({ type: "actions", elements: actionButtons });
     }
 
     blocks.push({
@@ -1006,6 +1082,21 @@ function getJobDownloadUrl(filename) {
 
 function getJobType(job) {
   return job?.type === DOCUMENT_TYPES.ODC ? DOCUMENT_TYPES.ODC : DOCUMENT_TYPES.DDR;
+}
+
+function getJobClarifyingAnswers(job) {
+  if (job?.session?.clarifyingAnswers && Object.keys(job.session.clarifyingAnswers).length > 0) {
+    return job.session.clarifyingAnswers;
+  }
+  const answers = {};
+  const ctx = job?.session?.additionalContext || [];
+  const qaBlock = ctx.find((c) => c.includes("--- Clarifying Questions Asked & Answers ---"));
+  if (qaBlock) {
+    for (const m of qaBlock.matchAll(/- Q: (.+?)\n\s+A: ([\s\S]+?)(?=\n- Q:|\n---|$)/g)) {
+      answers[m[1].trim()] = m[2].trim();
+    }
+  }
+  return answers;
 }
 
 function parseReferencedOdcJobId(text = "") {
@@ -2515,19 +2606,21 @@ function buildShortcutDocumentTypeChooserModal(
 }
 
 function buildChooserModal(sessionId, metadata) {
-  const documentType = metadata.documentType || DOCUMENT_TYPES.DDR;
+  const documentType = String(
+    metadata.documentType || DOCUMENT_TYPES.DDR
+  ).toLowerCase();
   const isOdc = documentType === DOCUMENT_TYPES.ODC;
   const noun = isOdc ? "ODC" : "DDR";
 
   const description = isOdc
-    ? "*Open Design Challenge (ODC)* — captures an unresolved design tension without advocating for a specific path. "
+    ? "*Open Design Challenge (ODC)* captures an unresolved design tension without advocating for a specific path.\n"
       + "ODCs stay in problem space: what's hard, what paths exist, and what happens if nothing changes.\n\n"
-      + "_Next steps:_ provide context → answer clarifying questions → AI generates an ODC document.\n\n"
-      + "> _Not sure which to use? Pick *ODC* when the problem is still open. Pick *DDR* when a decision has been made or proposed._"
-    : "*Design Decision Record (DDR)* — documents a design decision that's been made or proposed, including the problem, "
+      + "*Next steps:* provide context -> answer clarifying questions -> AI generates an ODC document.\n\n"
+      + "_Not sure which to use? Pick *ODC* when the problem is still open. Pick *DDR* when a decision has been made or proposed._"
+    : "*Design Decision Record (DDR)* documents a design decision that's been made or proposed, including the problem,\n"
       + "the decision, tradeoffs, and alternatives considered.\n\n"
-      + "_Next steps:_ provide context → answer clarifying questions → AI generates a DDR document.\n\n"
-      + "> _Not sure which to use? Pick *DDR* when a decision has been made or proposed. Pick *ODC* when the problem is still open._";
+      + "*Next steps:* provide context -> answer clarifying questions -> AI generates a DDR document.\n\n"
+      + "_Not sure which to use? Pick *DDR* when a decision has been made or proposed. Pick *ODC* when the problem is still open._";
 
   const blocks = [
     {
@@ -2942,7 +3035,8 @@ function buildClarifyingQuestionsModal(
   sourceMessages,
   clarifyingQuestions = [],
   additionalContext = [],
-  documentType = DOCUMENT_TYPES.DDR
+  documentType = DOCUMENT_TYPES.DDR,
+  previousAnswers = {}
 ) {
   const isOdc = documentType === DOCUMENT_TYPES.ODC;
   const contextPreview =
@@ -2972,24 +3066,28 @@ function buildClarifyingQuestionsModal(
               ]),
         ];
 
-  const questionBlocks = questionsToRender.map((question, index) => ({
-    type: "input",
-    block_id: `clarifying_q_${index}`,
-    optional: true,
-    element: {
-      type: "plain_text_input",
-      action_id: "answer_input",
-      multiline: true,
-      placeholder: {
-        type: "plain_text",
-        text: "Type your answer (text only; no video links/uploads).",
+  const questionBlocks = questionsToRender.map((question, index) => {
+    const prevAnswer = previousAnswers[question];
+    return {
+      type: "input",
+      block_id: `clarifying_q_${index}`,
+      optional: true,
+      element: {
+        type: "plain_text_input",
+        action_id: "answer_input",
+        multiline: true,
+        ...(prevAnswer ? { initial_value: prevAnswer } : {}),
+        placeholder: {
+          type: "plain_text",
+          text: "Type your answer (text only; no video links/uploads).",
+        },
       },
-    },
-    label: {
-      type: "plain_text",
-      text: `${index + 1}. ${question}`.slice(0, 200),
-    },
-  }));
+      label: {
+        type: "plain_text",
+        text: `${index + 1}. ${question}`.slice(0, 200),
+      },
+    };
+  });
 
   return {
     type: "modal",

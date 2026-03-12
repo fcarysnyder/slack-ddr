@@ -1,0 +1,42 @@
+{
+  "id": "ddr-e9354117-dd88-4c7e-ae5c-a8e72539d750",
+  "type": "ddr",
+  "status": "completed",
+  "stage": "posting_result",
+  "createdAt": 1773347251922,
+  "updatedAt": 1773347261161,
+  "sessionId": "10690136944658.303759590999.6d3a93a1826191b9736a7367b4bc7783",
+  "session": {
+    "channelId": "C0AL813T9DL",
+    "userId": "U090P2TUY3W",
+    "initiatedBy": "U090P2TUY3W",
+    "documentType": "ddr",
+    "origin": "slash",
+    "sourceMessageTs": null,
+    "sourceMessages": "(No source thread selected. Add context notes and optional Slack links in the form below.)",
+    "additionalContext": [],
+    "pendingLinkInputs": [],
+    "clarifyingQuestions": [
+      "What specific technical problem or business need are you trying to solve with this design decision?",
+      "What solution or approach have you decided to implement?",
+      "What were the main alternative solutions you considered but rejected, and why?",
+      "What are the expected benefits and positive outcomes of your chosen approach?",
+      "What are the main drawbacks, risks, or tradeoffs you're accepting with this decision?",
+      "Are there any relevant Slack discussions, messages, or threads that should be referenced in the DDR?"
+    ],
+    "selectedModel": "claude-sonnet-4-20250514",
+    "publishToCoda": true,
+    "ddrTitle": "TEST",
+    "odcTitle": "",
+    "odcStatus": "Open",
+    "sourceOdcJobId": null,
+    "codaRowUrl": "https://coda.io/d/_d_JJUOCLqA5/_sugrid-ssa-MiWlSr#_rii-fGtdf9ijHP",
+    "codaError": null,
+    "createdAt": 1773347244321,
+    "appNotInChannel": false
+  },
+  "progressChannel": "D0ALUJWK6JC",
+  "progressTs": "1773347252.024679",
+  "filename": "design-decision-2026-03-12T20-27-38-334Z.md",
+  "lastError": null
+}
