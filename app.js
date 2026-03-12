@@ -36,6 +36,10 @@ const anthropic = new Anthropic({
 const DEFAULT_MODEL = "claude-sonnet-4-20250514";
 const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
 const CODA_API_BASE = "https://coda.io/apis/v1";
+const DOCUMENT_TYPES = {
+  DDR: "ddr",
+  ODC: "odc",
+};
 const DEFAULT_DESIGN_DECISION_RECORDS_URL =
   "https://coda.io/d/Design-system_d_JJUOCLqA5/Design-Decision-Records-DDRs_su5gqDzd#Decisions_tuMiWlSr";
 const CODA_FEATURE_ENABLED = Boolean(process.env.CODA_API_TOKEN);
@@ -44,6 +48,7 @@ const SLACK_DDR_ANNOUNCE_CHANNEL = (process.env.SLACK_DDR_ANNOUNCE_CHANNEL || ""
 const CODA_COLUMN_ALIASES = {
   Title: ["Title", "Name"],
   "Date Proposed": ["Date Proposed", "Date proposed", "Date Created", "Date created"],
+  "Date Created": ["Date Created", "Date created"],
 };
 let modelOptionsCache = {
   fetchedAt: 0,
@@ -51,6 +56,8 @@ let modelOptionsCache = {
 };
 const codaColumnsCache = new Map();
 const slackChannelLookupCache = new Map();
+
+assertCodaConfiguration();
 
 const THINKING_WORDS = [
   "thinking",
@@ -86,6 +93,7 @@ const THINKING_WORDS = [
 // In-memory store for gathering context across interactions.
 // Keyed by a unique session ID (we use trigger_id or a generated one).
 const sessions = new Map();
+const pendingShortcutContexts = new Map();
 
 // HTTP server for file downloads (used when deployed; links in Slack point here).
 const downloadApp = express();
@@ -141,9 +149,33 @@ app.options({ action_id: "model_choice" }, async ({ ack, body }) => {
   }
 });
 
-// ─── Slash Command: /ddr ───────────────────────────────────────
-// Opens a chooser modal to start from scratch or from a Slack message.
+// ─── Slash Commands ─────────────────────────────────────────────
 app.command("/ddr", async ({ command, ack, client }) => {
+  await ack();
+
+  const triggerId = command.trigger_id;
+  const channelId = command.channel_id;
+  const initiatedBy = await resolveUserName(command.user_id, client);
+  const referencedOdcJobId = parseReferencedOdcJobId(command.text);
+
+  const sessionId = triggerId;
+  const metadata = {
+    channelId,
+    userId: command.user_id,
+    initiatedBy,
+    sessionId,
+    origin: "slash",
+    documentType: DOCUMENT_TYPES.DDR,
+    referencedOdcJobId,
+  };
+
+  await client.views.open({
+    trigger_id: triggerId,
+    view: buildChooserModal(sessionId, metadata),
+  });
+});
+
+app.command("/odc", async ({ command, ack, client }) => {
   await ack();
 
   const triggerId = command.trigger_id;
@@ -157,11 +189,12 @@ app.command("/ddr", async ({ command, ack, client }) => {
     initiatedBy,
     sessionId,
     origin: "slash",
+    documentType: DOCUMENT_TYPES.ODC,
   };
 
   await client.views.open({
     trigger_id: triggerId,
-    view: buildDdrChooserModal(sessionId, metadata),
+    view: buildChooserModal(sessionId, metadata),
   });
 });
 
@@ -170,6 +203,7 @@ app.command("/ddr-jobs", async ({ command, ack, client }) => {
 
   const query = parseDdrJobsQuery(command.text);
   const jobs = loadAllJobs()
+    .filter((job) => getJobType(job) === DOCUMENT_TYPES.DDR)
     .filter((job) => {
       if (query.jobId && job.id !== query.jobId) {
         return false;
@@ -184,7 +218,7 @@ app.command("/ddr-jobs", async ({ command, ack, client }) => {
     })
     .slice(0, query.limit);
 
-  const payload = buildDdrJobsPayload(jobs, { query });
+  const payload = buildJobsPayload(jobs, { query, documentType: DOCUMENT_TYPES.DDR });
 
   try {
     await client.chat.postEphemeral({
@@ -200,28 +234,76 @@ app.command("/ddr-jobs", async ({ command, ack, client }) => {
   }
 });
 
-// ─── Modal Submission: Chooser ────────────────────────────────
-app.view("ddr_chooser_submit", async ({ ack, view, client }) => {
+app.command("/odc-jobs", async ({ command, ack, client }) => {
+  await ack();
+
+  const query = parseDdrJobsQuery(command.text, DOCUMENT_TYPES.ODC);
+  const jobs = loadAllJobs()
+    .filter((job) => getJobType(job) === DOCUMENT_TYPES.ODC)
+    .filter((job) => {
+      if (query.jobId && job.id !== query.jobId) {
+        return false;
+      }
+      if (query.status && job.status !== query.status) {
+        return false;
+      }
+      if (query.scope !== "all" && job?.session?.userId !== command.user_id) {
+        return false;
+      }
+      return true;
+    })
+    .slice(0, query.limit);
+
+  const payload = buildJobsPayload(jobs, { query, documentType: DOCUMENT_TYPES.ODC });
+
+  try {
+    await client.chat.postEphemeral({
+      channel: command.channel_id,
+      user: command.user_id,
+      ...payload,
+    });
+  } catch (err) {
+    await client.chat.postMessage({
+      channel: command.user_id,
+      ...payload,
+    });
+  }
+});
+
+// ─── Modal Submission: Unified Source Chooser ──────────────────
+app.view("chooser_submit", async ({ ack, view, client }) => {
   const metadata = JSON.parse(view.private_metadata);
   const mode = view.state.values.chooser.mode.selected_option.value;
   const publishToCoda = getPublishToCodaValue(view.state.values);
-  const ddrTitle = (view.state.values.ddr_title?.title_input?.value || "").trim();
-  if (publishToCoda && !ddrTitle) {
+  const title = (view.state.values.record_title?.title_input?.value || "").trim();
+  const documentType = metadata.documentType || DOCUMENT_TYPES.DDR;
+  const isOdc = documentType === DOCUMENT_TYPES.ODC;
+  const noun = isOdc ? "ODC" : "DDR";
+
+  if (publishToCoda && !title) {
     await ack({
       response_action: "errors",
       errors: {
-        ddr_title: "DDR Title is required when Publish to Coda is checked.",
+        record_title: `${noun} Title is required when Publish to Coda is checked.`,
       },
     });
     return;
   }
 
-  const { channelId, userId, initiatedBy, sessionId, origin = "slash" } = metadata;
+  const {
+    channelId,
+    userId,
+    initiatedBy,
+    sessionId,
+    origin = "slash",
+    referencedOdcJobId = null,
+  } = metadata;
 
   sessions.set(sessionId, {
     channelId,
     userId,
     initiatedBy,
+    documentType,
     origin,
     sourceMessageTs: null,
     threadTs: undefined,
@@ -231,46 +313,69 @@ app.view("ddr_chooser_submit", async ({ ack, view, client }) => {
     clarifyingQuestions: [],
     selectedModel: DEFAULT_MODEL,
     publishToCoda,
-    ddrTitle,
+    ddrTitle: isOdc ? "" : title,
+    odcTitle: isOdc ? title : "",
+    odcStatus: "Open",
+    sourceOdcJobId: referencedOdcJobId || null,
     codaRowUrl: null,
     codaError: null,
     createdAt: Date.now(),
     appNotInChannel: false,
   });
 
-  if (mode === "from_scratch") {
-    await ack({
-      response_action: "update",
-      view: buildFromScratchModal(sessionId, DEFAULT_MODEL),
-    });
-  } else {
-    const noMessagePlaceholder =
-      "(No message selected. Add Slack message links and/or notes in the form below.)";
+  if (referencedOdcJobId) {
+    const referenced = loadJob(referencedOdcJobId);
+    if (!referenced || getJobType(referenced) !== DOCUMENT_TYPES.ODC) {
+      await ack({
+        response_action: "errors",
+        errors: {
+          chooser: `ODC job ${referencedOdcJobId} was not found.`,
+        },
+      });
+      sessions.delete(sessionId);
+      return;
+    }
+    if (String(referenced.documentStatus || "").toLowerCase() !== "resolved to ddr") {
+      await ack({
+        response_action: "errors",
+        errors: {
+          chooser: `ODC job ${referencedOdcJobId} must be "Resolved to DDR" before referencing it.`,
+        },
+      });
+      sessions.delete(sessionId);
+      return;
+    }
+    const sourceContext = buildReferencedOdcContext(referenced);
     const session = sessions.get(sessionId);
-    session.sourceMessages = noMessagePlaceholder;
-
-    await ack({
-      response_action: "update",
-      view: buildGatherContextModal(
-        sessionId,
-        noMessagePlaceholder,
-        [],
-        DEFAULT_MODEL,
-        false,
-        session.publishToCoda,
-        session.ddrTitle
-      ),
-    });
+    session.additionalContext.push(sourceContext);
   }
+
+  const noMessagePlaceholder =
+    mode === "from_scratch"
+      ? "(No source thread selected. Add context notes and optional Slack links in the form below.)"
+      : "(No message selected. Add Slack message links and/or notes in the form below.)";
+  const session = sessions.get(sessionId);
+  session.sourceMessages = noMessagePlaceholder;
+
+  await ack({
+    response_action: "update",
+    view: buildGatherContextModal(
+      sessionId,
+      noMessagePlaceholder,
+      [],
+      DEFAULT_MODEL,
+      false,
+      session.publishToCoda,
+      isOdc ? session.odcTitle : session.ddrTitle,
+      documentType
+    ),
+  });
 });
 
-// ─── Modal Submission: From Scratch ───────────────────────────
-app.view("scratch_prompt_submit", async ({ ack, view, client }) => {
+app.view("shortcut_document_type_submit", async ({ ack, view, client }) => {
   const sessionId = view.private_metadata;
-  const session = sessions.get(sessionId);
-
-  if (!session) {
-    console.warn("[scratch_prompt_submit] Missing session", { sessionId });
+  const pendingContext = pendingShortcutContexts.get(sessionId);
+  if (!pendingContext) {
     await ack({
       response_action: "update",
       view: buildSessionExpiredModal(sessionId),
@@ -278,181 +383,59 @@ app.view("scratch_prompt_submit", async ({ ack, view, client }) => {
     return;
   }
 
-  const promptText = view.state.values.scratch_prompt?.prompt_input?.value || "";
-  const selectedModel =
-    view.state.values.model_select?.model_choice?.selected_option?.value ||
-    DEFAULT_MODEL;
+  const selectedDocumentType =
+    view.state.values.document_type?.mode?.selected_option?.value || DOCUMENT_TYPES.DDR;
 
-  session.sourceMessages = promptText;
-  session.selectedModel = selectedModel;
-
-  // Continue directly to clarifying questions
-  await ack({
-    response_action: "update",
-    view: buildClarifyingLoadingModal(sessionId, pickRandomThinkingWord()),
-  });
-  console.log("[scratch_prompt_submit] Acked with loading modal", { sessionId });
-  const loadingStartedAt = Date.now();
-
-  const stopLoadingUpdates = startClarifyingLoadingUpdates(
-    client,
-    view.id,
-    sessionId
-  );
-
-  try {
-    console.log("[scratch_prompt_submit] Generating clarifying questions", {
-      sessionId,
-    });
-    const questions = await withTimeout(
-      generateClarifyingQuestions(session),
-      25000,
-      "clarifying question generation timed out"
-    );
-    session.clarifyingQuestions = questions;
-    console.log("[scratch_prompt_submit] Clarifying questions generated", {
-      sessionId,
-      count: questions.length,
-    });
-
-    await ensureMinimumElapsed(loadingStartedAt, 3000);
-    await client.views.update({
-      view_id: view.id,
-      view: buildClarifyingQuestionsModal(
-        sessionId,
-        session.sourceMessages,
-        questions,
-        session.additionalContext
-      ),
-    });
-    console.log("[scratch_prompt_submit] Updated to clarifying modal", {
-      sessionId,
-    });
-    stopLoadingUpdates();
-  } catch (err) {
-    console.error("[scratch_prompt_submit] Clarifying flow error:", err);
-    const fallbackQuestions = [
-      "What exact problem are we trying to solve?",
-      "What decision should be documented as the outcome?",
-      "What are the key tradeoffs or risks?",
-      "What alternatives were considered and why not chosen?",
-      "Any more context to include before finalizing?",
-    ];
-    session.clarifyingQuestions = fallbackQuestions;
-
-    try {
-      await ensureMinimumElapsed(loadingStartedAt, 3000);
-      await client.views.update({
-        view_id: view.id,
-        view: buildClarifyingQuestionsModal(
-          sessionId,
-          session.sourceMessages,
-          fallbackQuestions,
-          session.additionalContext
-        ),
-      });
-      stopLoadingUpdates();
-      await safePostEphemeralOrDM(
-        client,
-        session.channelId,
-        session.userId,
-        ":warning: Clarifying question generation was slow, so I used fallback questions. You can continue."
-      );
-    } catch (updateErr) {
-      console.error(
-        "[scratch_prompt_submit] Fallback clarifying modal update error:",
-        updateErr
-      );
-      stopLoadingUpdates();
-      await safePostEphemeralOrDM(
-        client,
-        session.channelId,
-        session.userId,
-        ":x: I hit a timeout preparing clarifying questions. Please retry the shortcut."
-      );
-      sessions.delete(sessionId);
-    }
-  }
-});
-
-// ─── Message Shortcut: "Log Design Decision" ───────────────────
-// This fires when a user clicks the shortcut from the message context menu.
-app.shortcut("log_design_decision", async ({ shortcut, ack, client }) => {
-  await ack();
-
-  const messageTs = shortcut.message_ts || shortcut.message?.ts;
-  const channelId = shortcut.channel?.id;
-  const triggerId = shortcut.trigger_id;
-
-  // Fetch the thread if the message is part of one, otherwise just the message
-  let messages = [];
-  let appNotInChannel = false;
-  try {
-    if (shortcut.message?.thread_ts) {
-      // It's in a thread, grab the whole thread
-      const threadResult = await client.conversations.replies({
-        channel: channelId,
-        ts: shortcut.message.thread_ts,
-        limit: 100,
-      });
-      messages = threadResult.messages || [];
-    } else {
-      // Single message, but check if it's a thread parent
-      const threadResult = await client.conversations.replies({
-        channel: channelId,
-        ts: messageTs,
-        limit: 100,
-      });
-      messages = threadResult.messages || [];
-    }
-  } catch (err) {
-    console.error("Error fetching messages:", err);
-    if (err.data?.error === 'channel_not_found' || err.data?.error === 'not_in_channel') {
-      appNotInChannel = true;
-    }
-    // Fall back to just the clicked message
-    messages = [shortcut.message];
-  }
-
-  // Format messages into readable text
-  const formattedMessages = await formatMessages(messages, client);
-  const initiatedBy = await resolveUserName(shortcut.user.id, client);
-
-  // Store session
-  const sessionId = triggerId;
   sessions.set(sessionId, {
-    channelId,
-    userId: shortcut.user.id,
-    initiatedBy,
+    channelId: pendingContext.channelId,
+    userId: pendingContext.userId,
+    initiatedBy: pendingContext.initiatedBy,
+    documentType: selectedDocumentType,
     origin: "shortcut",
-    sourceMessageTs: messageTs,
-    threadTs: shortcut.message?.thread_ts || messageTs,
-    sourceMessages: formattedMessages,
+    sourceMessageTs: pendingContext.sourceMessageTs,
+    threadTs: pendingContext.threadTs,
+    sourceMessages: pendingContext.sourceMessages,
     additionalContext: [],
     pendingLinkInputs: [],
     clarifyingQuestions: [],
     selectedModel: DEFAULT_MODEL,
     publishToCoda: false,
     ddrTitle: "",
+    odcTitle: "",
+    odcStatus: "Open",
+    sourceOdcJobId: null,
     codaRowUrl: null,
     codaError: null,
     createdAt: Date.now(),
-    appNotInChannel,
+    appNotInChannel: pendingContext.appNotInChannel,
   });
+  pendingShortcutContexts.delete(sessionId);
 
-  // Open modal asking if they want to add more context
-  await client.views.open({
-    trigger_id: triggerId,
+  await ack({
+    response_action: "update",
     view: buildGatherContextModal(
       sessionId,
-      formattedMessages,
+      pendingContext.sourceMessages,
       [],
       DEFAULT_MODEL,
-      appNotInChannel,
+      pendingContext.appNotInChannel,
       false,
-      ""
+      "",
+      selectedDocumentType
     ),
   });
+});
+
+// ─── Message Shortcut: "Log Design Decision" ───────────────────
+// This fires when a user clicks the shortcut from the message context menu.
+app.shortcut("log_design_decision", async ({ shortcut, ack, client }) => {
+  await ack();
+  await openShortcutTypeChooser(shortcut, client, DOCUMENT_TYPES.DDR);
+});
+
+app.shortcut("log_design_challenge", async ({ shortcut, ack, client }) => {
+  await ack();
+  await openShortcutTypeChooser(shortcut, client, DOCUMENT_TYPES.ODC);
 });
 
 // ─── Modal Submission: Gather More Context ──────────────────────
@@ -476,8 +459,12 @@ app.view("gather_context_submit", async ({ ack, body, view, client }) => {
   const selectedModel =
     view.state.values.model_select?.model_choice?.selected_option?.value ||
     DEFAULT_MODEL;
+  const documentType = session.documentType || DOCUMENT_TYPES.DDR;
+  const isOdc = documentType === DOCUMENT_TYPES.ODC;
+  const noun = isOdc ? "ODC" : "DDR";
   const publishToCoda = getPublishToCodaValue(view.state.values);
-  const ddrTitle = (view.state.values.ddr_title?.title_input?.value || "").trim();
+  const formTitle = (view.state.values.record_title?.title_input?.value || "").trim();
+  const effectiveTitle = formTitle || (isOdc ? session.odcTitle : session.ddrTitle) || "";
   const gatherErrors = {};
   if (containsVideoReference(additionalLinks)) {
     gatherErrors.additional_links =
@@ -487,8 +474,8 @@ app.view("gather_context_submit", async ({ ack, body, view, client }) => {
     gatherErrors.additional_notes =
       "Video links/uploads are not supported in this form.";
   }
-  if (publishToCoda && !ddrTitle) {
-    gatherErrors.ddr_title = "DDR Title is required when Publish to Coda is checked.";
+  if (publishToCoda && !effectiveTitle) {
+    gatherErrors.record_title = `${noun} Title is required when Publish to Coda is checked.`;
   }
   if (Object.keys(gatherErrors).length > 0) {
     await ack({ response_action: "errors", errors: gatherErrors });
@@ -498,13 +485,17 @@ app.view("gather_context_submit", async ({ ack, body, view, client }) => {
     sessionId,
     selectedModel,
     publishToCoda,
-    hasDdrTitle: Boolean(ddrTitle),
+    hasTitle: Boolean(effectiveTitle),
     hasAdditionalLinks: Boolean(additionalLinks.trim()),
     hasAdditionalNotes: Boolean(additionalNotes.trim()),
   });
   session.selectedModel = selectedModel;
   session.publishToCoda = publishToCoda;
-  session.ddrTitle = ddrTitle;
+  if (isOdc) {
+    session.odcTitle = effectiveTitle;
+  } else {
+    session.ddrTitle = effectiveTitle;
+  }
 
   if (additionalLinks.trim()) {
     // Queue links so we can ack quickly, then fetch in background.
@@ -570,7 +561,8 @@ app.view("gather_context_submit", async ({ ack, body, view, client }) => {
         sessionId,
         session.sourceMessages,
         questions,
-        session.additionalContext
+        session.additionalContext,
+        session.documentType
       ),
     });
     console.log("[gather_context_submit] Updated to clarifying modal", {
@@ -579,13 +571,22 @@ app.view("gather_context_submit", async ({ ack, body, view, client }) => {
     stopLoadingUpdates();
   } catch (err) {
     console.error("[gather_context_submit] Clarifying flow error:", err);
-    const fallbackQuestions = [
-      "What exact problem are we trying to solve?",
-      "What decision should be documented as the outcome?",
-      "What are the key tradeoffs or risks?",
-      "What alternatives were considered and why not chosen?",
-      "Any more Slack links/context/content to include before finalizing?",
-    ];
+    const fallbackQuestions =
+      documentType === DOCUMENT_TYPES.ODC
+        ? [
+            "What is the core tension in one sentence?",
+            "What makes this hard structurally?",
+            "What paths have been discussed, and what tradeoffs came up?",
+            "What concrete friction persists if we take no action?",
+            "Any more Slack links/context/content to include before finalizing?",
+          ]
+        : [
+            "What exact problem are we trying to solve?",
+            "What decision should be documented as the outcome?",
+            "What are the key tradeoffs or risks?",
+            "What alternatives were considered and why not chosen?",
+            "Any more Slack links/context/content to include before finalizing?",
+          ];
     session.clarifyingQuestions = fallbackQuestions;
 
     try {
@@ -596,7 +597,8 @@ app.view("gather_context_submit", async ({ ack, body, view, client }) => {
           sessionId,
           session.sourceMessages,
           fallbackQuestions,
-          session.additionalContext
+          session.additionalContext,
+          session.documentType
         ),
       });
       stopLoadingUpdates();
@@ -738,6 +740,53 @@ app.action("resume_ddr_job", async ({ ack, body, action, client }) => {
   await executeDdrJob(job, client, { resumedBy: body.user.id });
 });
 
+app.action("resume_odc_job", async ({ ack, body, action, client }) => {
+  await ack();
+
+  const jobId = action?.value;
+  if (!jobId) {
+    return;
+  }
+
+  const job = loadJob(jobId);
+  if (!job) {
+    await safePostEphemeralOrDM(
+      client,
+      body.channel?.id,
+      body.user.id,
+      ":warning: I couldn't find that ODC recovery job anymore."
+    );
+    return;
+  }
+
+  if (job.status === "in_progress") {
+    await safePostEphemeralOrDM(
+      client,
+      body.channel?.id || job.session?.channelId,
+      body.user.id,
+      `:hourglass_flowing_sand: Job \`${job.id}\` is already running.`
+    );
+    return;
+  }
+
+  if (!job.session) {
+    await safePostEphemeralOrDM(
+      client,
+      body.channel?.id || job.session?.channelId,
+      body.user.id,
+      `:x: Job \`${job.id}\` is missing recovery context and cannot be resumed.`
+    );
+    return;
+  }
+
+  job.status = "in_progress";
+  job.updatedAt = Date.now();
+  job.lastError = null;
+  await persistJob(job);
+
+  await executeDdrJob(job, client, { resumedBy: body.user.id });
+});
+
 async function safePostEphemeralOrDM(client, channelId, userId, text) {
   try {
     await client.chat.postEphemeral({
@@ -758,7 +807,7 @@ async function safePostEphemeralOrDM(client, channelId, userId, text) {
   }
 }
 
-function parseDdrJobsQuery(text = "") {
+function parseDdrJobsQuery(text = "", documentType = DOCUMENT_TYPES.DDR) {
   const tokens = String(text)
     .trim()
     .split(/\s+/)
@@ -785,7 +834,8 @@ function parseDdrJobsQuery(text = "") {
       query.status = tokenLower;
       continue;
     }
-    if (tokenLower.startsWith("ddr-")) {
+    const idPrefix = documentType === DOCUMENT_TYPES.ODC ? "odc-" : "ddr-";
+    if (tokenLower.startsWith(idPrefix)) {
       query.jobId = token;
       continue;
     }
@@ -829,8 +879,13 @@ function loadAllJobs() {
   });
 }
 
-function buildDdrJobsPayload(jobs, context) {
-  const { query } = context;
+function buildJobsPayload(jobs, context) {
+  const { query, documentType = DOCUMENT_TYPES.DDR } = context;
+  const isOdc = documentType === DOCUMENT_TYPES.ODC;
+  const noun = isOdc ? "ODC" : "DDR";
+  const idHint = isOdc ? "odc-<id>" : "ddr-<id>";
+  const resumeActionId = isOdc ? "resume_odc_job" : "resume_ddr_job";
+  const resumeButtonText = isOdc ? "Resume ODC generation" : "Resume DDR generation";
   const statusText = query.status ? `status=${query.status}` : "status=any";
   const scopeText = query.scope === "all" ? "scope=all" : "scope=mine";
   const titleText = `Showing ${jobs.length} job(s) (${scopeText}, ${statusText}, limit=${query.limit})`;
@@ -840,7 +895,7 @@ function buildDdrJobsPayload(jobs, context) {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: `*DDR Jobs*\n${titleText}`,
+        text: `*${noun} Jobs*\n${titleText}`,
       },
     },
     {
@@ -848,7 +903,9 @@ function buildDdrJobsPayload(jobs, context) {
       elements: [
         {
           type: "mrkdwn",
-          text: "Usage: `/ddr-jobs`, `/ddr-jobs failed`, `/ddr-jobs all failed 15`, `/ddr-jobs ddr-<id>`",
+          text: isOdc
+            ? `Usage: \`/odc-jobs\`, \`/odc-jobs failed\`, \`/odc-jobs all failed 15\`, \`/odc-jobs ${idHint}\``
+            : `Usage: \`/ddr-jobs\`, \`/ddr-jobs failed\`, \`/ddr-jobs all failed 15\`, \`/ddr-jobs ${idHint}\``,
         },
       ],
     },
@@ -866,7 +923,7 @@ function buildDdrJobsPayload(jobs, context) {
       },
     });
     return {
-      text: `DDR Jobs: ${titleText}`,
+      text: `${noun} Jobs: ${titleText}`,
       blocks,
     };
   }
@@ -896,10 +953,10 @@ function buildDdrJobsPayload(jobs, context) {
         elements: [
           {
             type: "button",
-            action_id: "resume_ddr_job",
+            action_id: resumeActionId,
             text: {
               type: "plain_text",
-              text: "Resume DDR generation",
+              text: resumeButtonText,
             },
             style: "primary",
             value: job.id,
@@ -914,7 +971,7 @@ function buildDdrJobsPayload(jobs, context) {
   }
 
   return {
-    text: `DDR Jobs: ${titleText}`,
+    text: `${noun} Jobs: ${titleText}`,
     blocks: blocks.slice(0, 50),
   };
 }
@@ -941,9 +998,47 @@ function getJobDownloadUrl(filename) {
   return `${process.env.PUBLIC_URL.replace(/\/$/, "")}/download/${filename}`;
 }
 
+function getJobType(job) {
+  return job?.type === DOCUMENT_TYPES.ODC ? DOCUMENT_TYPES.ODC : DOCUMENT_TYPES.DDR;
+}
+
+function parseReferencedOdcJobId(text = "") {
+  const match = String(text || "").match(/\bodc-[a-f0-9-]{8,}\b/i);
+  return match ? match[0] : null;
+}
+
+function buildReferencedOdcContext(odcJob) {
+  const sourceMarkdown = odcJob?.filename
+    ? tryReadMarkdownFile(odcJob.filename)
+    : "";
+  const safeMarkdown = sourceMarkdown || "(ODC markdown unavailable)";
+  return [
+    "--- Source ODC ---",
+    `Referenced ODC Job ID: ${odcJob.id}`,
+    `ODC Status: ${odcJob.documentStatus || "Unknown"}`,
+    "Use this as upstream context for the DDR.",
+    safeMarkdown,
+  ].join("\n");
+}
+
+function tryReadMarkdownFile(filename) {
+  try {
+    if (!filename) {
+      return "";
+    }
+    const filepath = join(DATA_DIR, filename);
+    if (!existsSync(filepath)) {
+      return "";
+    }
+    return readFileSync(filepath, "utf8");
+  } catch {
+    return "";
+  }
+}
+
 function getDesignDecisionRecordsUrl() {
-  const docId = process.env.CODA_DOC_ID;
-  const tableId = process.env.CODA_TABLE_ID;
+  const docId = process.env.CODA_DOC_DDR_ID;
+  const tableId = process.env.CODA_TABLE_DDR_ID;
   if (docId && tableId) {
     return `https://coda.io/d/_d${docId}#_tu${tableId}`;
   }
@@ -1046,6 +1141,40 @@ function parseDdrMarkdown(markdown, fallbackTitle = "") {
   };
 }
 
+function parseOdcMarkdown(markdown, fallbackTitle = "") {
+  const normalized = String(markdown || "").replace(/\r\n/g, "\n");
+  const titleMatch = normalized.match(/^#\s+Open Design Challenge:\s*(.+)$/m);
+  const title = titleMatch
+    ? titleMatch[1].trim()
+    : String(fallbackTitle || "").trim() || "Untitled ODC";
+  const statusMatch = normalized.match(/^\*\*Status:\*\*\s*(.+)$/m);
+  const status = statusMatch ? statusMatch[1].trim() : "Open";
+
+  const sectionHeadingPattern = /^##\s+(.+)$/gm;
+  const sections = {};
+  const headingMatches = [...normalized.matchAll(sectionHeadingPattern)];
+
+  for (let i = 0; i < headingMatches.length; i += 1) {
+    const current = headingMatches[i];
+    const heading = current[1].trim().toLowerCase();
+    const contentStart = current.index + current[0].length;
+    const contentEnd =
+      i + 1 < headingMatches.length ? headingMatches[i + 1].index : normalized.length;
+    const content = normalized.slice(contentStart, contentEnd).trim();
+    sections[heading] = content;
+  }
+
+  return {
+    title,
+    status,
+    challenge: sections.challenge || "",
+    whyItsHard: sections["why it's hard"] || "",
+    pathsConsidered: sections["paths considered"] || "",
+    costOfNoAction: sections["cost of no action"] || "",
+    additionalContext: sections["additional context"] || "",
+  };
+}
+
 function splitMarkdownTableRow(row) {
   return String(row || "")
     .trim()
@@ -1134,11 +1263,36 @@ function getCodaHeaders() {
   };
 }
 
-function getCodaTablePath() {
-  const docId = process.env.CODA_DOC_ID;
-  const tableId = process.env.CODA_TABLE_ID;
+function assertCodaConfiguration() {
+  if (!process.env.CODA_API_TOKEN) {
+    return;
+  }
+  const required = [
+    "CODA_DOC_DDR_ID",
+    "CODA_TABLE_DDR_ID",
+    "CODA_DOC_ODC_ID",
+    "CODA_TABLE_ODC_ID",
+  ];
+  const missing = required.filter((name) => !String(process.env[name] || "").trim());
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing required Coda environment variables: ${missing.join(
+        ", "
+      )}. Add all four IDs when CODA_API_TOKEN is set.`
+    );
+  }
+}
+
+function getCodaTablePath(documentType = DOCUMENT_TYPES.DDR) {
+  const isOdc = documentType === DOCUMENT_TYPES.ODC;
+  const docId = isOdc ? process.env.CODA_DOC_ODC_ID : process.env.CODA_DOC_DDR_ID;
+  const tableId = isOdc ? process.env.CODA_TABLE_ODC_ID : process.env.CODA_TABLE_DDR_ID;
   if (!docId || !tableId) {
-    throw new Error("CODA_DOC_ID and CODA_TABLE_ID must be set to publish to Coda");
+    throw new Error(
+      isOdc
+        ? "CODA_DOC_ODC_ID and CODA_TABLE_ODC_ID must be set to publish ODCs to Coda"
+        : "CODA_DOC_DDR_ID and CODA_TABLE_DDR_ID must be set to publish DDRs to Coda"
+    );
   }
   return {
     docId,
@@ -1147,8 +1301,8 @@ function getCodaTablePath() {
   };
 }
 
-async function getCodaColumnMap() {
-  const { tablePath } = getCodaTablePath();
+async function getCodaColumnMap(documentType = DOCUMENT_TYPES.DDR) {
+  const { tablePath } = getCodaTablePath(documentType);
   const cacheKey = tablePath;
   if (codaColumnsCache.has(cacheKey)) {
     return codaColumnsCache.get(cacheKey);
@@ -1188,41 +1342,81 @@ function getRequiredCodaColumnId(columnMap, columnName) {
   return columnId;
 }
 
-async function publishToCoda(session, parsedSections) {
+async function publishToCoda(session, parsedSections, documentType = DOCUMENT_TYPES.DDR) {
   try {
-    const columnMap = await getCodaColumnMap();
-    const { docId, tableId, tablePath } = getCodaTablePath();
+    const columnMap = await getCodaColumnMap(documentType);
+    const { docId, tableId, tablePath } = getCodaTablePath(documentType);
     const today = new Date().toLocaleDateString("en-US");
-    const title = String(session.ddrTitle || parsedSections.title || "Untitled DDR").trim();
-    const problem = normalizeMarkdownForCoda(parsedSections.problem);
-    const decision = normalizeMarkdownForCoda(parsedSections.decision);
-    const consequences = normalizeMarkdownForCoda(parsedSections.consequences);
-    const alternativesConsidered = normalizeMarkdownForCoda(parsedSections.alternativesConsidered);
-    const additionalContext = normalizeMarkdownForCoda(parsedSections.additionalContext);
-
-    const cells = [
-      { column: getRequiredCodaColumnId(columnMap, "Title"), value: title },
-      {
-        column: getRequiredCodaColumnId(columnMap, "Author"),
-        value: "",
-      },
-      { column: getRequiredCodaColumnId(columnMap, "Status"), value: CODA_DEFAULT_STATUS },
-      { column: getRequiredCodaColumnId(columnMap, "Date Proposed"), value: today },
-      { column: getRequiredCodaColumnId(columnMap, "Problem"), value: problem },
-      { column: getRequiredCodaColumnId(columnMap, "Decision"), value: decision },
-      {
-        column: getRequiredCodaColumnId(columnMap, "Consequences"),
-        value: consequences,
-      },
-      {
-        column: getRequiredCodaColumnId(columnMap, "Alternatives Considered"),
-        value: alternativesConsidered,
-      },
-      {
-        column: getRequiredCodaColumnId(columnMap, "Additional Context"),
-        value: additionalContext,
-      },
-    ];
+    const cells =
+      documentType === DOCUMENT_TYPES.ODC
+        ? [
+            {
+              column: getRequiredCodaColumnId(columnMap, "Title"),
+              value: String(session.odcTitle || parsedSections.title || "Untitled ODC").trim(),
+            },
+            {
+              column: getRequiredCodaColumnId(columnMap, "Date Created"),
+              value: today,
+            },
+            {
+              column: getRequiredCodaColumnId(columnMap, "Challenge"),
+              value: normalizeMarkdownForCoda(parsedSections.challenge),
+            },
+            {
+              column: getRequiredCodaColumnId(columnMap, "Why It's Hard"),
+              value: normalizeMarkdownForCoda(parsedSections.whyItsHard),
+            },
+            {
+              column: getRequiredCodaColumnId(columnMap, "Paths Considered"),
+              value: normalizeMarkdownForCoda(parsedSections.pathsConsidered),
+            },
+            {
+              column: getRequiredCodaColumnId(columnMap, "Cost of No Action"),
+              value: normalizeMarkdownForCoda(parsedSections.costOfNoAction),
+            },
+            {
+              column: getRequiredCodaColumnId(columnMap, "Additional Context"),
+              value: normalizeMarkdownForCoda(parsedSections.additionalContext),
+            },
+            {
+              column: getRequiredCodaColumnId(columnMap, "Status"),
+              value: parsedSections.status || session.odcStatus || "Open",
+            },
+          ]
+        : [
+            {
+              column: getRequiredCodaColumnId(columnMap, "Title"),
+              value: String(session.ddrTitle || parsedSections.title || "Untitled DDR").trim(),
+            },
+            {
+              column: getRequiredCodaColumnId(columnMap, "Status"),
+              value: CODA_DEFAULT_STATUS,
+            },
+            {
+              column: getRequiredCodaColumnId(columnMap, "Date Proposed"),
+              value: today,
+            },
+            {
+              column: getRequiredCodaColumnId(columnMap, "Problem"),
+              value: normalizeMarkdownForCoda(parsedSections.problem),
+            },
+            {
+              column: getRequiredCodaColumnId(columnMap, "Decision"),
+              value: normalizeMarkdownForCoda(parsedSections.decision),
+            },
+            {
+              column: getRequiredCodaColumnId(columnMap, "Consequences"),
+              value: normalizeMarkdownForCoda(parsedSections.consequences),
+            },
+            {
+              column: getRequiredCodaColumnId(columnMap, "Alternatives Considered"),
+              value: normalizeMarkdownForCoda(parsedSections.alternativesConsidered),
+            },
+            {
+              column: getRequiredCodaColumnId(columnMap, "Additional Context"),
+              value: normalizeMarkdownForCoda(parsedSections.additionalContext),
+            },
+          ];
 
     const insertResponse = await fetch(`${CODA_API_BASE}/${tablePath}/rows`, {
       method: "POST",
@@ -1274,8 +1468,10 @@ async function publishToCoda(session, parsedSections) {
 }
 
 function createDdrJob(session, sessionId) {
+  const documentType = session.documentType || DOCUMENT_TYPES.DDR;
   return {
-    id: `ddr-${randomUUID()}`,
+    id: `${documentType}-${randomUUID()}`,
+    type: documentType,
     status: "in_progress",
     stage: "context",
     createdAt: Date.now(),
@@ -1317,8 +1513,10 @@ function renderAsciiProgressBar(percent, width = 20) {
 
 function buildProgressText(job, stageKey, extra = "") {
   const stage = JOB_PROGRESS[stageKey] || { percent: 0, label: "Working" };
+  const documentType = getJobType(job);
+  const noun = documentType === DOCUMENT_TYPES.ODC ? "ODC" : "DDR";
   const base = [
-    ":hourglass_flowing_sand: Creating DDR locally...",
+    `:hourglass_flowing_sand: Creating ${noun} locally...`,
     `\`${renderAsciiProgressBar(stage.percent)}\``,
     `Stage: ${stage.label}`,
     `Job ID: \`${job.id}\``,
@@ -1459,6 +1657,10 @@ function classifySynthesisError(err) {
 
 async function postRecoveryAction(client, job, detailsText) {
   const destinationChannel = job.progressChannel || job.session?.userId;
+  const documentType = getJobType(job);
+  const noun = documentType === DOCUMENT_TYPES.ODC ? "ODC" : "DDR";
+  const resumeActionId = documentType === DOCUMENT_TYPES.ODC ? "resume_odc_job" : "resume_ddr_job";
+  const resumeText = documentType === DOCUMENT_TYPES.ODC ? "Resume ODC generation" : "Resume DDR generation";
   if (!destinationChannel) {
     return;
   }
@@ -1466,13 +1668,13 @@ async function postRecoveryAction(client, job, detailsText) {
   try {
     await client.chat.postMessage({
       channel: destinationChannel,
-      text: `DDR job ${job.id} failed. Use Resume DDR generation.`,
+      text: `${noun} job ${job.id} failed. Use ${resumeText}.`,
       blocks: [
         {
           type: "section",
           text: {
             type: "mrkdwn",
-            text: `:warning: *DDR generation failed*\n${detailsText}\nJob ID: \`${job.id}\``,
+            text: `:warning: *${noun} generation failed*\n${detailsText}\nJob ID: \`${job.id}\``,
           },
         },
         {
@@ -1480,10 +1682,10 @@ async function postRecoveryAction(client, job, detailsText) {
           elements: [
             {
               type: "button",
-              action_id: "resume_ddr_job",
+              action_id: resumeActionId,
               text: {
                 type: "plain_text",
-                text: "Resume DDR generation",
+                text: resumeText,
               },
               style: "primary",
               value: job.id,
@@ -1498,8 +1700,10 @@ async function postRecoveryAction(client, job, detailsText) {
 }
 
 async function postFinalDdrMessage(client, session, filename) {
+  const documentType = session.documentType || DOCUMENT_TYPES.DDR;
+  const noun = documentType === DOCUMENT_TYPES.ODC ? "ODC" : "DDR";
   const createdByText = session.userId ? `<@${session.userId}>` : "unknown user";
-  const baseText = `A DDR was created from this message by ${createdByText} (model: ${
+  const baseText = `A ${noun} was created from this message by ${createdByText} (model: ${
     session.selectedModel || DEFAULT_MODEL
   })`;
   const downloadUrl = getJobDownloadUrl(filename);
@@ -1557,8 +1761,8 @@ async function postFinalDdrMessage(client, session, filename) {
     console.warn("Could not post to channel, falling back to DM", postErr.message);
     const dmText = [
       downloadUrl
-        ? `Your DDR was created, but I couldn't post in the channel. <${downloadUrl}|💾 Download .md file>`
-        : "Your DDR was created and saved, but I couldn't post the confirmation in the original channel because I haven't been added to it.",
+        ? `Your ${noun} was created, but I couldn't post in the channel. <${downloadUrl}|💾 Download .md file>`
+        : `Your ${noun} was created and saved, but I couldn't post the confirmation in the original channel because I haven't been added to it.`,
       fallbackLink,
       codaWarning,
     ]
@@ -1573,6 +1777,8 @@ async function postFinalDdrMessage(client, session, filename) {
 
 async function executeDdrJob(job, client, options = {}) {
   const session = job.session || {};
+  const documentType = getJobType(job);
+  const noun = documentType === DOCUMENT_TYPES.ODC ? "ODC" : "DDR";
 
   try {
     await updateProgressMessage(
@@ -1584,9 +1790,9 @@ async function executeDdrJob(job, client, options = {}) {
 
     await updateProgressMessage(client, job, "calling_model");
     const markdown = await withTimeout(
-      synthesizeDecision(session),
+      synthesizeDocument(session),
       120000,
-      "DDR synthesis timed out while waiting for model output"
+      `${noun} synthesis timed out while waiting for model output`
     );
 
     await updateProgressMessage(client, job, "model_done");
@@ -1594,15 +1800,29 @@ async function executeDdrJob(job, client, options = {}) {
 
     mkdirSync(DATA_DIR, { recursive: true });
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const filename = `design-decision-${timestamp}.md`;
+    const filename =
+      documentType === DOCUMENT_TYPES.ODC
+        ? `open-design-challenge-${timestamp}.md`
+        : `design-decision-${timestamp}.md`;
     const filepath = join(DATA_DIR, filename);
-    writeFileSync(filepath, markdown);
+    const finalMarkdown =
+      documentType === DOCUMENT_TYPES.DDR
+        ? ensureDdrContainsSourceOdcReference(markdown, session.sourceOdcJobId)
+        : markdown;
+    writeFileSync(filepath, finalMarkdown);
     job.filename = filename;
+    if (documentType === DOCUMENT_TYPES.ODC) {
+      const parsedOdc = parseOdcMarkdown(finalMarkdown, session.odcTitle);
+      job.documentStatus = parsedOdc.status || session.odcStatus || "Open";
+    }
     await persistJob(job);
 
     if (session.publishToCoda) {
-      const parsed = parseDdrMarkdown(markdown, session.ddrTitle);
-      const codaResult = await publishToCoda(session, parsed);
+      const parsed =
+        documentType === DOCUMENT_TYPES.ODC
+          ? parseOdcMarkdown(finalMarkdown, session.odcTitle)
+          : parseDdrMarkdown(finalMarkdown, session.ddrTitle);
+      const codaResult = await publishToCoda(session, parsed, documentType);
       session.codaRowUrl = codaResult.rowUrl;
       session.codaError = codaResult.error;
       await persistJob(job);
@@ -1620,7 +1840,7 @@ async function executeDdrJob(job, client, options = {}) {
         channel: job.progressChannel,
         ts: job.progressTs,
         text: [
-          ":white_check_mark: DDR generation complete.",
+          `:white_check_mark: ${noun} generation complete.`,
           `\`${renderAsciiProgressBar(100)}\``,
           `Job ID: \`${job.id}\``,
           job.filename ? `Saved as \`${job.filename}\`.` : "",
@@ -1632,6 +1852,7 @@ async function executeDdrJob(job, client, options = {}) {
   } catch (err) {
     console.error("[executeDdrJob] Synthesis error:", err);
     const diagnosis = classifySynthesisError(err);
+    const diagnosisMessage = personalizeDiagnosisMessage(diagnosis.userMessage, documentType);
 
     job.status = "failed";
     job.lastError = {
@@ -1643,25 +1864,79 @@ async function executeDdrJob(job, client, options = {}) {
     await persistJob(job);
 
     const failureText = [
-      diagnosis.userMessage,
+      diagnosisMessage,
       job.filename
         ? `Recovered work saved in \`${job.filename}\`${getJobDownloadUrl(job.filename) ? ` (<${getJobDownloadUrl(job.filename)}|download>)` : ""}.`
         : "No markdown file was written yet, but all context is saved in this job.",
     ].join("\n");
 
-    await updateProgressMessage(client, job, job.stage || "calling_model", `:x: ${diagnosis.userMessage}`);
+    await updateProgressMessage(client, job, job.stage || "calling_model", `:x: ${diagnosisMessage}`);
     await postRecoveryAction(client, job, failureText);
 
     await safePostEphemeralOrDM(
       client,
       session.channelId,
       session.userId,
-      `:x: ${diagnosis.userMessage}\nJob ID: \`${job.id}\``
+      `:x: ${diagnosisMessage}\nJob ID: \`${job.id}\``
     );
   }
 }
 
 // ─── Helpers ────────────────────────────────────────────────────
+
+async function openShortcutTypeChooser(shortcut, client, initialType = DOCUMENT_TYPES.DDR) {
+  const messageTs = shortcut.message_ts || shortcut.message?.ts;
+  const channelId = shortcut.channel?.id;
+  const triggerId = shortcut.trigger_id;
+
+  let messages = [];
+  let appNotInChannel = false;
+  try {
+    if (shortcut.message?.thread_ts) {
+      const threadResult = await client.conversations.replies({
+        channel: channelId,
+        ts: shortcut.message.thread_ts,
+        limit: 100,
+      });
+      messages = threadResult.messages || [];
+    } else {
+      const threadResult = await client.conversations.replies({
+        channel: channelId,
+        ts: messageTs,
+        limit: 100,
+      });
+      messages = threadResult.messages || [];
+    }
+  } catch (err) {
+    console.error("[openShortcutTypeChooser] Error fetching messages:", err);
+    if (err.data?.error === "channel_not_found" || err.data?.error === "not_in_channel") {
+      appNotInChannel = true;
+    }
+    messages = [shortcut.message];
+  }
+
+  const formattedMessages = await formatMessages(messages, client);
+  const initiatedBy = await resolveUserName(shortcut.user.id, client);
+  const sessionId = triggerId;
+  pendingShortcutContexts.set(sessionId, {
+    channelId,
+    userId: shortcut.user.id,
+    initiatedBy,
+    sourceMessageTs: messageTs,
+    threadTs: shortcut.message?.thread_ts || messageTs,
+    sourceMessages: formattedMessages,
+    appNotInChannel,
+  });
+
+  await client.views.open({
+    trigger_id: triggerId,
+    view: buildShortcutDocumentTypeChooserModal(sessionId, {
+      sourceMessages: formattedMessages,
+      appNotInChannel,
+      initialType,
+    }),
+  });
+}
 
 async function formatMessages(messages, client) {
   // Resolve user IDs to names for readability
@@ -1798,7 +2073,14 @@ function containsVideoReference(text = "") {
   return videoPattern.test(text);
 }
 
-async function synthesizeDecision(session) {
+async function synthesizeDocument(session) {
+  if ((session.documentType || DOCUMENT_TYPES.DDR) === DOCUMENT_TYPES.ODC) {
+    return synthesizeOpenDesignChallenge(session);
+  }
+  return synthesizeDecisionRecord(session);
+}
+
+async function synthesizeDecisionRecord(session) {
   const dateProposed = new Date().toLocaleDateString("en-US");
   const sourceLabel = session.sourceMessageTs ? "--- Original Thread/Message ---" : "--- User-Provided Context ---";
   const allContext = [
@@ -1872,6 +2154,76 @@ Output the decision log in this exact markdown format:
   });
 }
 
+async function synthesizeOpenDesignChallenge(session) {
+  const dateRaised = new Date().toLocaleDateString("en-US");
+  const sourceLabel = session.sourceMessageTs
+    ? "--- Original Thread/Message ---"
+    : "--- User-Provided Context ---";
+  const allContext = [
+    sourceLabel,
+    session.sourceMessages,
+    `--- ODC Metadata ---\nChallenge: ${session.odcTitle || "Untitled ODC"}\nStatus: ${
+      session.odcStatus || "Open"
+    }\nDate: ${dateRaised}\nRaised by: ${session.initiatedBy || "Unknown"}`,
+    ...session.additionalContext,
+  ].join("\n\n");
+
+  const response = await anthropic.messages.create({
+    model: session.selectedModel || DEFAULT_MODEL,
+    max_tokens: 4000,
+    system: `You are an Open Design Challenge documentation assistant.
+
+Your job is to turn Slack context into a neutral, structured Open Design Challenge (ODC).
+
+Critical rules:
+- Stay in problem space. Do not advocate for any path.
+- Never include the banned s-word anywhere in your output.
+- Clearly name the core tension in one sentence.
+- Explain why the tension exists structurally in plain language.
+- List paths considered with tradeoffs only, without ranking.
+- Describe cost of no action with concrete, observable friction.
+- Use neutral, precise language understandable to non-technical stakeholders.
+
+Output in this exact markdown format:
+
+# Open Design Challenge: [Challenge Title]
+
+**Status:** [Open | In Progress | Resolved to DDR]
+**Date:** [date]
+**Raised by:** [name if known]
+
+---
+
+## Challenge
+[One sentence]
+
+## Why It's Hard
+[Plain language explanation of implementation/design reality]
+
+## Paths Considered
+[Bulleted or numbered list with tradeoffs only]
+
+## Cost of No Action
+[Specific ongoing friction]
+
+## Additional Context
+[Source conversation, related work, future directions]`,
+    messages: [
+      {
+        role: "user",
+        content: `Generate an Open Design Challenge markdown document from this context:\n\n${allContext}`,
+      },
+    ],
+  });
+
+  return applyOdcHeaderDefaults(response.content[0].text, {
+    dateRaised,
+    raisedBy: session.initiatedBy || "",
+    status: session.odcStatus || "Open",
+    title: session.odcTitle || "Untitled ODC",
+  });
+}
+
 function applyDecisionHeaderDefaults(markdown, metadata) {
   const lines = String(markdown || "")
     .replace(/\r\n/g, "\n")
@@ -1901,6 +2253,65 @@ function applyDecisionHeaderDefaults(markdown, metadata) {
     .trimEnd();
 }
 
+function applyOdcHeaderDefaults(markdown, metadata) {
+  const normalized = String(markdown || "").replace(/\r\n/g, "\n");
+  const parsed = parseOdcMarkdown(normalized, metadata.title);
+  return [
+    `# Open Design Challenge: ${parsed.title || metadata.title || "Untitled ODC"}`,
+    "",
+    `**Status:** ${parsed.status || metadata.status || "Open"}`,
+    `**Date:** ${metadata.dateRaised}`,
+    `**Raised by:** ${metadata.raisedBy || ""}`,
+    "",
+    "---",
+    "",
+    "## Challenge",
+    parsed.challenge || "",
+    "",
+    "## Why It's Hard",
+    parsed.whyItsHard || "",
+    "",
+    "## Paths Considered",
+    parsed.pathsConsidered || "",
+    "",
+    "## Cost of No Action",
+    parsed.costOfNoAction || "",
+    "",
+    "## Additional Context",
+    parsed.additionalContext || "",
+  ]
+    .join("\n")
+    .trimEnd();
+}
+
+function ensureDdrContainsSourceOdcReference(markdown, sourceOdcJobId) {
+  if (!sourceOdcJobId) {
+    return markdown;
+  }
+  const normalized = String(markdown || "").replace(/\r\n/g, "\n");
+  if (/Source ODC Job:\s*`?odc-/i.test(normalized)) {
+    return normalized;
+  }
+
+  if (/##\s+Additional Context/i.test(normalized)) {
+    return normalized.replace(
+      /##\s+Additional Context\s*\n/i,
+      `## Additional Context\n\n- Source ODC Job: \`${sourceOdcJobId}\`\n`
+    );
+  }
+
+  return `${normalized.trimEnd()}\n\n## Additional Context\n\n- Source ODC Job: \`${sourceOdcJobId}\`\n`;
+}
+
+function personalizeDiagnosisMessage(message, documentType = DOCUMENT_TYPES.DDR) {
+  if (documentType !== DOCUMENT_TYPES.ODC) {
+    return message;
+  }
+  return String(message || "")
+    .replaceAll("DDR", "ODC")
+    .replaceAll("design decision", "design challenge");
+}
+
 async function resolveUserName(userId, client) {
   try {
     const userInfo = await client.users.info({ user: userId });
@@ -1924,10 +2335,25 @@ async function generateClarifyingQuestions(session) {
     ...session.additionalContext,
   ].join("\n\n");
 
+  const isOdc = (session.documentType || DOCUMENT_TYPES.DDR) === DOCUMENT_TYPES.ODC;
   const response = await anthropic.messages.create({
     model: session.selectedModel || DEFAULT_MODEL,
     max_tokens: 500,
-    system: `You are helping prepare a design decision record from Slack context.
+    system: isOdc
+      ? `You are helping prepare an Open Design Challenge from Slack context.
+
+Before drafting the ODC, ask concise clarifying questions to fill missing context.
+Focus on these sections:
+- Challenge (one-sentence tension)
+- Why It's Hard (structural constraints)
+- Paths Considered (tradeoffs only, no advocacy)
+- Cost of No Action (observable ongoing friction)
+- Additional Context
+
+Do not ask for a final answer.
+
+Return ONLY a bullet list of 3-6 short questions, one question per line, each starting with "- ".`
+      : `You are helping prepare a design decision record from Slack context.
 
 Before drafting the DDR, ask concise clarifying questions to fill any missing information.
 Focus on these sections:
@@ -1960,16 +2386,120 @@ Return ONLY a bullet list of 3-6 short questions, one question per line, each st
     return parsed;
   }
 
-  return [
-    "What exact problem are we trying to solve?",
-    "What decision do you want documented as the primary outcome?",
-    "What are the key tradeoffs or risks?",
-    "What alternatives were considered and why were they not chosen?",
-    "Is there any other Slack link/context/content we should include?",
-  ];
+  return isOdc
+    ? [
+        "What is the core tension in one sentence?",
+        "What implementation reality makes this difficult?",
+        "What paths have been discussed so far, and what tradeoffs came up?",
+        "What concrete friction continues if this stays unresolved?",
+        "Any additional links or context that should be captured?",
+      ]
+    : [
+        "What exact problem are we trying to solve?",
+        "What decision do you want documented as the primary outcome?",
+        "What are the key tradeoffs or risks?",
+        "What alternatives were considered and why were they not chosen?",
+        "Is there any other Slack link/context/content we should include?",
+      ];
 }
 
-function buildDdrChooserModal(sessionId, metadata) {
+function buildShortcutDocumentTypeChooserModal(
+  sessionId,
+  { sourceMessages = "", appNotInChannel = false, initialType = DOCUMENT_TYPES.DDR } = {}
+) {
+  const contextPreview = String(sourceMessages || "").substring(0, 350);
+  const blocks = [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `:clipboard: *Captured conversation preview:*\n\`\`\`${contextPreview}...\`\`\``,
+      },
+    },
+    {
+      type: "divider",
+    },
+    {
+      type: "input",
+      block_id: "document_type",
+      element: {
+        type: "radio_buttons",
+        action_id: "mode",
+        initial_option: {
+          text: {
+            type: "plain_text",
+            text:
+              initialType === DOCUMENT_TYPES.ODC
+                ? "Open Design Challenge (ODC)"
+                : "Design Decision Record (DDR)",
+          },
+          value: initialType,
+        },
+        options: [
+          {
+            text: {
+              type: "plain_text",
+              text: "Design Decision Record (DDR)",
+            },
+            value: DOCUMENT_TYPES.DDR,
+          },
+          {
+            text: {
+              type: "plain_text",
+              text: "Open Design Challenge (ODC)",
+            },
+            value: DOCUMENT_TYPES.ODC,
+          },
+        ],
+      },
+      label: {
+        type: "plain_text",
+        text: "What do you want to create?",
+      },
+    },
+  ];
+
+  if (appNotInChannel) {
+    blocks.unshift(
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text:
+            "⚠️ *Note: The app is not in this channel/DM.* It can only see the single message you clicked, not the full thread.",
+        },
+      },
+      {
+        type: "divider",
+      }
+    );
+  }
+
+  return {
+    type: "modal",
+    callback_id: "shortcut_document_type_submit",
+    private_metadata: sessionId,
+    title: {
+      type: "plain_text",
+      text: "Create Record",
+    },
+    submit: {
+      type: "plain_text",
+      text: "Next",
+    },
+    close: {
+      type: "plain_text",
+      text: "Cancel",
+    },
+    blocks,
+  };
+}
+
+function buildChooserModal(sessionId, metadata) {
+  const documentType = metadata.documentType || DOCUMENT_TYPES.DDR;
+  const isOdc = documentType === DOCUMENT_TYPES.ODC;
+  const noun = isOdc ? "ODC" : "DDR";
+
   const blocks = [
     {
       type: "input",
@@ -2034,7 +2564,7 @@ function buildDdrChooserModal(sessionId, metadata) {
       },
       {
         type: "input",
-        block_id: "ddr_title",
+        block_id: "record_title",
         optional: true,
         element: {
           type: "plain_text_input",
@@ -2046,7 +2576,7 @@ function buildDdrChooserModal(sessionId, metadata) {
         },
         label: {
           type: "plain_text",
-          text: "DDR Title",
+          text: `${noun} Title`,
         },
       }
     );
@@ -2054,11 +2584,11 @@ function buildDdrChooserModal(sessionId, metadata) {
 
   return {
     type: "modal",
-    callback_id: "ddr_chooser_submit",
+    callback_id: "chooser_submit",
     private_metadata: JSON.stringify(metadata),
     title: {
       type: "plain_text",
-      text: "Log Design Decision",
+      text: isOdc ? "Log Design Challenge" : "Log Design Decision",
     },
     submit: {
       type: "plain_text",
@@ -2072,63 +2602,6 @@ function buildDdrChooserModal(sessionId, metadata) {
   };
 }
 
-function buildFromScratchModal(sessionId, selectedModel = DEFAULT_MODEL) {
-  return {
-    type: "modal",
-    callback_id: "scratch_prompt_submit",
-    private_metadata: sessionId,
-    title: {
-      type: "plain_text",
-      text: "Design Decision Log",
-    },
-    submit: {
-      type: "plain_text",
-      text: "Submit",
-    },
-    close: {
-      type: "plain_text",
-      text: "Cancel",
-    },
-    blocks: [
-      {
-        type: "input",
-        block_id: "scratch_prompt",
-        element: {
-          type: "plain_text_input",
-          action_id: "prompt_input",
-          multiline: true,
-          placeholder: {
-            type: "plain_text",
-            text: "Describe the design decision, problem, and context...",
-          },
-        },
-        label: {
-          type: "plain_text",
-          text: "Decision Details",
-        },
-      },
-      {
-        type: "input",
-        block_id: "model_select",
-        element: {
-          type: "external_select",
-          action_id: "model_choice",
-          min_query_length: 0,
-          placeholder: {
-            type: "plain_text",
-            text: "Choose a Claude model",
-          },
-          initial_option: buildModelOption(selectedModel),
-        },
-        label: {
-          type: "plain_text",
-          text: "Claude Model",
-        },
-      },
-    ],
-  };
-}
-
 function buildGatherContextModal(
   sessionId,
   sourceMessages,
@@ -2136,8 +2609,11 @@ function buildGatherContextModal(
   selectedModel = DEFAULT_MODEL,
   appNotInChannel = false,
   publishToCoda = false,
-  ddrTitle = ""
+  title = "",
+  documentType = DOCUMENT_TYPES.DDR
 ) {
+  const isOdc = documentType === DOCUMENT_TYPES.ODC;
+  const noun = isOdc ? "ODC" : "DDR";
   const contextPreview =
     typeof sourceMessages === "string"
       ? sourceMessages.substring(0, 500)
@@ -2252,12 +2728,12 @@ function buildGatherContextModal(
       },
       {
         type: "input",
-        block_id: "ddr_title",
+        block_id: "record_title",
         optional: true,
         element: {
           type: "plain_text_input",
           action_id: "title_input",
-          initial_value: ddrTitle,
+          initial_value: title,
           placeholder: {
             type: "plain_text",
             text: "Required if Publish to Coda is checked",
@@ -2265,7 +2741,7 @@ function buildGatherContextModal(
         },
         label: {
           type: "plain_text",
-          text: "DDR Title",
+          text: `${noun} Title`,
         },
       }
     );
@@ -2292,7 +2768,7 @@ function buildGatherContextModal(
     private_metadata: sessionId,
     title: {
       type: "plain_text",
-      text: "Design Decision Log",
+      text: isOdc ? "Open Design Challenge" : "Design Decision Log",
     },
     submit: {
       type: "plain_text",
@@ -2426,8 +2902,10 @@ function buildClarifyingQuestionsModal(
   sessionId,
   sourceMessages,
   clarifyingQuestions = [],
-  additionalContext = []
+  additionalContext = [],
+  documentType = DOCUMENT_TYPES.DDR
 ) {
+  const isOdc = documentType === DOCUMENT_TYPES.ODC;
   const contextPreview =
     typeof sourceMessages === "string"
       ? sourceMessages.substring(0, 350)
@@ -2442,9 +2920,17 @@ function buildClarifyingQuestionsModal(
     clarifyingQuestions.length > 0
       ? clarifyingQuestions
       : [
-          "What exact problem are we trying to solve?",
-          "What decision should be documented as the outcome?",
-          "What are the key tradeoffs or risks?",
+          ...(isOdc
+            ? [
+                "What is the core tension in one sentence?",
+                "Why is this hard structurally?",
+                "What paths have been considered so far with tradeoffs?",
+              ]
+            : [
+                "What exact problem are we trying to solve?",
+                "What decision should be documented as the outcome?",
+                "What are the key tradeoffs or risks?",
+              ]),
         ];
 
   const questionBlocks = questionsToRender.map((question, index) => ({
@@ -2472,11 +2958,11 @@ function buildClarifyingQuestionsModal(
     private_metadata: sessionId,
     title: {
       type: "plain_text",
-      text: "Clarify Before DDR",
+      text: isOdc ? "Clarify Before ODC" : "Clarify Before DDR",
     },
     submit: {
       type: "plain_text",
-      text: "Create DDR",
+      text: isOdc ? "Create ODC" : "Create DDR",
     },
     close: {
       type: "plain_text",
@@ -2498,7 +2984,9 @@ function buildClarifyingQuestionsModal(
         text: {
           type: "mrkdwn",
           text:
-            "*Please answer each clarifying question below before I generate the DDR.*\n_Text only in this UI (no video uploads/links)._",
+            isOdc
+              ? "*Please answer each clarifying question below before I generate the ODC.*\n_Text only in this UI (no video uploads/links)._"
+              : "*Please answer each clarifying question below before I generate the DDR.*\n_Text only in this UI (no video uploads/links)._",
         },
       },
       ...questionBlocks,
