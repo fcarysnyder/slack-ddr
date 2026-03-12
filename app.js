@@ -35,6 +35,7 @@ const anthropic = new Anthropic({
 
 const DEFAULT_MODEL = "claude-sonnet-4-20250514";
 const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
+const JOB_STALLED_AFTER_MS = Number(process.env.JOB_STALLED_AFTER_MS || 15 * 60 * 1000);
 const CODA_API_BASE = "https://coda.io/apis/v1";
 const DOCUMENT_TYPES = {
   DDR: "ddr",
@@ -211,10 +212,11 @@ app.command("/ddr-jobs", async ({ command, ack, client }) => {
   const jobs = loadAllJobs()
     .filter((job) => getJobType(job) === DOCUMENT_TYPES.DDR)
     .filter((job) => {
+      const effectiveStatus = getEffectiveJobStatus(job);
       if (query.jobId && job.id !== query.jobId) {
         return false;
       }
-      if (query.status && job.status !== query.status) {
+      if (query.status && effectiveStatus !== query.status) {
         return false;
       }
       if (query.scope !== "all" && job?.session?.userId !== command.user_id) {
@@ -247,10 +249,11 @@ app.command("/odc-jobs", async ({ command, ack, client }) => {
   const jobs = loadAllJobs()
     .filter((job) => getJobType(job) === DOCUMENT_TYPES.ODC)
     .filter((job) => {
+      const effectiveStatus = getEffectiveJobStatus(job);
       if (query.jobId && job.id !== query.jobId) {
         return false;
       }
-      if (query.status && job.status !== query.status) {
+      if (query.status && effectiveStatus !== query.status) {
         return false;
       }
       if (query.scope !== "all" && job?.session?.userId !== command.user_id) {
@@ -722,7 +725,7 @@ app.action("resume_ddr_job", async ({ ack, body, action, client }) => {
     return;
   }
 
-  if (job.status === "in_progress") {
+  if (job.status === "in_progress" && !isJobStalled(job)) {
     await safePostEphemeralOrDM(
       client,
       body.channel?.id || job.session?.channelId,
@@ -769,7 +772,7 @@ app.action("resume_odc_job", async ({ ack, body, action, client }) => {
     return;
   }
 
-  if (job.status === "in_progress") {
+  if (job.status === "in_progress" && !isJobStalled(job)) {
     await safePostEphemeralOrDM(
       client,
       body.channel?.id || job.session?.channelId,
@@ -906,7 +909,7 @@ function parseDdrJobsQuery(text = "", documentType = DOCUMENT_TYPES.DDR) {
       query.scope = "mine";
       continue;
     }
-    if (["failed", "completed", "in_progress"].includes(tokenLower)) {
+    if (["failed", "completed", "in_progress", "stalled"].includes(tokenLower)) {
       query.status = tokenLower;
       continue;
     }
@@ -982,8 +985,8 @@ function buildJobsPayload(jobs, context) {
         {
           type: "mrkdwn",
           text: isOdc
-            ? `Usage: \`/odc-jobs\`, \`/odc-jobs failed\`, \`/odc-jobs all failed 15\`, \`/odc-jobs ${idHint}\``
-            : `Usage: \`/ddr-jobs\`, \`/ddr-jobs failed\`, \`/ddr-jobs all failed 15\`, \`/ddr-jobs ${idHint}\``,
+            ? `Usage: \`/odc-jobs\`, \`/odc-jobs stalled\`, \`/odc-jobs all failed 15\`, \`/odc-jobs ${idHint}\``
+            : `Usage: \`/ddr-jobs\`, \`/ddr-jobs stalled\`, \`/ddr-jobs all failed 15\`, \`/ddr-jobs ${idHint}\``,
         },
       ],
     },
@@ -1007,6 +1010,7 @@ function buildJobsPayload(jobs, context) {
   }
 
   for (const job of jobs) {
+    const effectiveStatus = getEffectiveJobStatus(job);
     const stage = JOB_PROGRESS[job.stage]?.label || job.stage || "Unknown stage";
     const updatedAt = formatTimestamp(job.updatedAt || job.createdAt);
     const model = job?.session?.selectedModel || DEFAULT_MODEL;
@@ -1021,12 +1025,12 @@ function buildJobsPayload(jobs, context) {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: `*${job.id}* - \`${job.status}\`\nStage: ${stage}\nUpdated: ${updatedAt}\nModel: \`${model}\`${filename}${downloadLine}${errorLine}`,
+        text: `*${job.id}* - \`${effectiveStatus}\`\nStage: ${stage}\nUpdated: ${updatedAt}\nModel: \`${model}\`${filename}${downloadLine}${errorLine}`,
       },
     });
 
     const actionButtons = [];
-    if (job.status === "failed") {
+    if (effectiveStatus === "failed" || effectiveStatus === "stalled") {
       actionButtons.push({
         type: "button",
         action_id: resumeActionId,
@@ -1035,7 +1039,7 @@ function buildJobsPayload(jobs, context) {
         value: job.id,
       });
     }
-    if ((job.status === "failed" || job.status === "completed") && job.session) {
+    if ((effectiveStatus === "failed" || effectiveStatus === "stalled" || effectiveStatus === "completed") && job.session) {
       actionButtons.push({
         type: "button",
         action_id: restartActionId,
@@ -1082,6 +1086,24 @@ function getJobDownloadUrl(filename) {
 
 function getJobType(job) {
   return job?.type === DOCUMENT_TYPES.ODC ? DOCUMENT_TYPES.ODC : DOCUMENT_TYPES.DDR;
+}
+
+function getEffectiveJobStatus(job, now = Date.now()) {
+  if (job?.status !== "in_progress") {
+    return job?.status || "unknown";
+  }
+  const lastUpdated = Number(job?.updatedAt || job?.createdAt || 0);
+  if (!lastUpdated) {
+    return "stalled";
+  }
+  if (now - lastUpdated >= JOB_STALLED_AFTER_MS) {
+    return "stalled";
+  }
+  return "in_progress";
+}
+
+function isJobStalled(job, now = Date.now()) {
+  return getEffectiveJobStatus(job, now) === "stalled";
 }
 
 function getJobClarifyingAnswers(job) {
