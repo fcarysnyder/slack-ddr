@@ -431,7 +431,7 @@ app.view("shortcut_document_type_submit", async ({ ack, view, client }) => {
     pendingLinkInputs: [],
     clarifyingQuestions: [],
     selectedModel: DEFAULT_MODEL,
-    publishToCoda: false,
+    publishToCoda: true,
     ddrTitle: "",
     odcTitle: "",
     odcStatus: "Open",
@@ -2043,6 +2043,9 @@ async function executeDdrJob(job, client, options = {}) {
     await persistJob(job);
 
     if (job.progressChannel && job.progressTs) {
+      const progressCodaLink = session.codaRowUrl
+        ? `<${session.codaRowUrl}|🔗 View in Coda>`
+        : null;
       await client.chat.update({
         channel: job.progressChannel,
         ts: job.progressTs,
@@ -2051,6 +2054,7 @@ async function executeDdrJob(job, client, options = {}) {
           `\`${renderAsciiProgressBar(100)}\``,
           `Job ID: \`${job.id}\``,
           job.filename ? `Saved as \`${job.filename}\`.` : "",
+          progressCodaLink,
         ]
           .filter(Boolean)
           .join("\n"),
@@ -3069,6 +3073,15 @@ function buildChooserModal(sessionId, metadata) {
         element: {
           type: "checkboxes",
           action_id: "publish_to_coda",
+          initial_options: [
+            {
+              text: {
+                type: "plain_text",
+                text: "Publish to Coda",
+              },
+              value: "publish",
+            },
+          ],
           options: [
             {
               text: {
@@ -3130,7 +3143,7 @@ function buildGatherContextModal(
   additionalContext = [],
   selectedModel = DEFAULT_MODEL,
   appNotInChannel = false,
-  publishToCoda = false,
+  publishToCoda = true,
   title = "",
   documentType = DOCUMENT_TYPES.DDR
 ) {
