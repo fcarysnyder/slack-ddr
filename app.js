@@ -1662,6 +1662,7 @@ async function publishToCoda(session, parsedSections, documentType = DOCUMENT_TY
       };
     }
     const rowPayload = await rowResponse.json();
+    console.log("[publishToCoda] Row browserLink:", rowPayload?.browserLink, "| fallbackRowUrl:", fallbackRowUrl);
     return {
       success: true,
       rowUrl: rowPayload?.browserLink || fallbackRowUrl,
@@ -1935,6 +1936,7 @@ async function postFinalDdrMessage(client, session, filename) {
     .filter(Boolean)
     .join("\n");
 
+  // Post to the configured announce channel (if any).
   const configuredAnnounceChannel = await resolveAnnounceChannel(client);
   if (configuredAnnounceChannel) {
     try {
@@ -1942,7 +1944,6 @@ async function postFinalDdrMessage(client, session, filename) {
         channel: configuredAnnounceChannel,
         text: channelText,
       });
-      return;
     } catch (postErr) {
       console.warn(
         "[postFinalDdrMessage] Could not post to configured announce channel",
@@ -1951,6 +1952,7 @@ async function postFinalDdrMessage(client, session, filename) {
     }
   }
 
+  // Also post back to the original thread/channel/DM so the user sees it inline.
   if (session.origin === "slash") {
     await client.chat.postMessage({
       channel: session.userId,
