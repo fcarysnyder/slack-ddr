@@ -1595,6 +1595,10 @@ async function publishToCoda(session, parsedSections, documentType = DOCUMENT_TY
               value: today,
             },
             {
+              column: getRequiredCodaColumnId(columnMap, "Date Created"),
+              value: today,
+            },
+            {
               column: getRequiredCodaColumnId(columnMap, "Problem"),
               value: normalizeMarkdownForCoda(parsedSections.problem),
             },
