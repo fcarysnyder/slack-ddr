@@ -327,6 +327,10 @@ app.view("chooser_submit", async ({ ack, view, client }) => {
     referencedOdcJobId = null,
   } = metadata;
 
+  // Preserve step 2 form data if user navigated back and is re-submitting step 1
+  const existingSession = sessions.get(sessionId);
+  const savedGatherForm = existingSession?.savedGatherForm;
+
   sessions.set(sessionId, {
     channelId,
     userId,
@@ -397,7 +401,9 @@ app.view("chooser_submit", async ({ ack, view, client }) => {
       false,
       session.publishToCoda,
       isOdc ? session.odcTitle : session.ddrTitle,
-      documentType
+      documentType,
+      savedGatherForm?.links || "",
+      savedGatherForm?.notes || ""
     ),
   });
 });
@@ -415,6 +421,10 @@ app.view("shortcut_document_type_submit", async ({ ack, view, client }) => {
 
   const selectedDocumentType =
     view.state.values.document_type?.mode?.selected_option?.value || DOCUMENT_TYPES.DDR;
+
+  // Preserve step 2 form data if user navigated back and is re-submitting step 1
+  const existingSession = sessions.get(sessionId);
+  const savedGatherForm = existingSession?.savedGatherForm;
 
   sessions.set(sessionId, {
     channelId: pendingContext.channelId,
@@ -453,7 +463,9 @@ app.view("shortcut_document_type_submit", async ({ ack, view, client }) => {
       pendingContext.appNotInChannel,
       false,
       "",
-      selectedDocumentType
+      selectedDocumentType,
+      savedGatherForm?.links || "",
+      savedGatherForm?.notes || ""
     ),
   });
 });
@@ -468,6 +480,110 @@ app.shortcut("log_design_decision", async ({ shortcut, ack, client }) => {
 app.shortcut("log_design_challenge", async ({ shortcut, ack, client }) => {
   await ack();
   await openShortcutTypeChooser(shortcut, client, DOCUMENT_TYPES.ODC);
+});
+
+// ─── Back Navigation ────────────────────────────────────────────
+app.action("nav_back", async ({ ack, body, action, client }) => {
+  await ack();
+  const { targetStep, sessionId } = JSON.parse(action.value);
+  const session = sessions.get(sessionId);
+  if (!session) {
+    console.warn("[nav_back] Missing session", { sessionId });
+    return;
+  }
+
+  const documentType = session.documentType || DOCUMENT_TYPES.DDR;
+  const isOdc = documentType === DOCUMENT_TYPES.ODC;
+
+  if (targetStep === 1) {
+    // Save current step 2 form values so they survive the round-trip
+    const vals = body.view?.state?.values || {};
+    session.savedGatherForm = {
+      links: vals.additional_links?.links_input?.value || "",
+      notes: vals.additional_notes?.notes_input?.value || "",
+      model: vals.model_select?.model_choice?.selected_option?.value || session.selectedModel,
+      publishToCoda: getPublishToCodaValue(vals),
+      title: vals.record_title?.title_input?.value || "",
+    };
+
+    let newView;
+    if (session.origin === "shortcut") {
+      // For shortcut flow, go back to document type chooser.
+      // Re-store context so the shortcut handler can use it on re-submit.
+      pendingShortcutContexts.set(sessionId, {
+        channelId: session.channelId,
+        userId: session.userId,
+        initiatedBy: session.initiatedBy,
+        sourceMessageTs: session.sourceMessageTs,
+        threadTs: session.threadTs,
+        sourceMessages: session.sourceMessages,
+        slackReferences: session.slackReferences || [],
+        slackImageCandidates: session.slackImageCandidates || [],
+        appNotInChannel: session.appNotInChannel,
+      });
+      newView = buildShortcutDocumentTypeChooserModal(sessionId, {
+        sourceMessages: session.sourceMessages,
+        appNotInChannel: session.appNotInChannel,
+        initialType: documentType,
+      });
+    } else {
+      // For slash command flow, go back to chooser modal
+      const metadata = {
+        channelId: session.channelId,
+        userId: session.userId,
+        initiatedBy: session.initiatedBy,
+        sessionId,
+        origin: session.origin,
+        documentType,
+        referencedOdcJobId: session.sourceOdcJobId || null,
+      };
+      newView = buildChooserModal(sessionId, metadata);
+    }
+
+    await client.views.update({ view_id: body.view.id, view: newView });
+  } else if (targetStep === 2) {
+    // Going back from step 3 (clarifying questions) to step 2 (gather context)
+    // Capture current clarifying answers for later repopulation
+    const vals = body.view?.state?.values || {};
+    const questions = session.clarifyingQuestions || [];
+    const currentAnswers = {};
+    questions.forEach((question, index) => {
+      const answer = vals[`clarifying_q_${index}`]?.answer_input?.value?.trim() || "";
+      if (answer) currentAnswers[question] = answer;
+    });
+    session.clarifyingAnswers = currentAnswers;
+
+    // Restore session state to before step 2 processing
+    if (session.preGatherSnapshot) {
+      session.additionalContext = session.additionalContext.slice(
+        0, session.preGatherSnapshot.additionalContextLength
+      );
+      session.slackReferences = session.slackReferences.slice(
+        0, session.preGatherSnapshot.slackReferencesLength
+      );
+      session.slackImageCandidates = session.slackImageCandidates.slice(
+        0, session.preGatherSnapshot.slackImageCandidatesLength
+      );
+      session.pendingLinkInputs = [];
+    }
+
+    const newView = buildGatherContextModal(
+      sessionId,
+      session.sourceMessages,
+      session.additionalContext,
+      session.selectedModel,
+      session.appNotInChannel,
+      session.publishToCoda,
+      isOdc ? session.odcTitle : session.ddrTitle,
+      documentType,
+      session.gatherFormLinks || "",
+      session.gatherFormNotes || ""
+    );
+
+    await client.views.update({ view_id: body.view.id, view: newView });
+  }
+
+  console.log("[nav_back] Navigated back", { sessionId, targetStep });
 });
 
 // ─── Modal Submission: Gather More Context ──────────────────────
@@ -524,6 +640,16 @@ app.view("gather_context_submit", async ({ ack, body, view, client }) => {
   session.selectedModel = selectedModel;
   session.publishToCoda = publishToCoda;
   ensureSessionSlackCollections(session);
+
+  // Snapshot state before processing so we can restore on back navigation
+  session.preGatherSnapshot = {
+    additionalContextLength: session.additionalContext.length,
+    slackReferencesLength: session.slackReferences.length,
+    slackImageCandidatesLength: session.slackImageCandidates.length,
+  };
+  // Save raw form values for repopulation if user navigates back
+  session.gatherFormLinks = additionalLinks;
+  session.gatherFormNotes = additionalNotes;
   if (isOdc) {
     session.odcTitle = effectiveTitle;
   } else {
@@ -617,7 +743,8 @@ app.view("gather_context_submit", async ({ ack, body, view, client }) => {
         session.sourceMessages,
         questions,
         session.additionalContext,
-        session.documentType
+        session.documentType,
+        session.clarifyingAnswers || {}
       ),
     });
     console.log("[gather_context_submit] Updated to clarifying modal", {
@@ -653,7 +780,8 @@ app.view("gather_context_submit", async ({ ack, body, view, client }) => {
           session.sourceMessages,
           fallbackQuestions,
           session.additionalContext,
-          session.documentType
+          session.documentType,
+          session.clarifyingAnswers || {}
         ),
       });
       stopLoadingUpdates();
@@ -2900,12 +3028,52 @@ Return ONLY a bullet list of 3-6 short questions, one question per line, each st
       ];
 }
 
+// ─── Step Progress / Back Navigation ─────────────────────────────
+function buildStepProgressBlocks(currentStep, totalSteps, sessionId) {
+  const dots = Array.from({ length: totalSteps }, (_, i) =>
+    i < currentStep ? "●" : "○"
+  ).join("  ");
+
+  const blocks = [
+    {
+      type: "context",
+      block_id: "step_progress",
+      elements: [
+        {
+          type: "mrkdwn",
+          text: `${dots}    Step ${currentStep} of ${totalSteps}`,
+        },
+      ],
+    },
+  ];
+
+  if (currentStep > 1) {
+    blocks.push({
+      type: "actions",
+      block_id: "step_navigation",
+      elements: [
+        {
+          type: "button",
+          action_id: "nav_back",
+          text: { type: "plain_text", text: "◀ Back" },
+          value: JSON.stringify({ targetStep: currentStep - 1, sessionId }),
+        },
+      ],
+    });
+  }
+
+  blocks.push({ type: "divider" });
+
+  return blocks;
+}
+
 function buildShortcutDocumentTypeChooserModal(
   sessionId,
   { sourceMessages = "", appNotInChannel = false, initialType = DOCUMENT_TYPES.DDR } = {}
 ) {
   const contextPreview = String(sourceMessages || "").substring(0, 350);
   const blocks = [
+    ...buildStepProgressBlocks(1, 3, sessionId),
     {
       type: "section",
       text: {
@@ -3005,7 +3173,7 @@ function buildShortcutDocumentTypeChooserModal(
   };
 }
 
-function buildChooserModal(sessionId, metadata) {
+function buildChooserModal(sessionId, metadata, { initialMode = "from_scratch" } = {}) {
   const documentType = String(
     metadata.documentType || DOCUMENT_TYPES.DDR
   ).toLowerCase();
@@ -3022,7 +3190,19 @@ function buildChooserModal(sessionId, metadata) {
       + "*Next steps:* provide context -> answer clarifying questions -> AI generates a DDR document.\n\n"
       + "_Not sure which to use? Pick *DDR* when a decision has been made or proposed. Pick *ODC* when the problem is still open._";
 
+  const modeOptions = [
+    {
+      text: { type: "plain_text", text: "Start from scratch" },
+      value: "from_scratch",
+    },
+    {
+      text: { type: "plain_text", text: "From a Slack message" },
+      value: "from_message",
+    },
+  ];
+
   const blocks = [
+    ...buildStepProgressBlocks(1, 3, sessionId),
     {
       type: "section",
       text: {
@@ -3039,29 +3219,8 @@ function buildChooserModal(sessionId, metadata) {
       element: {
         type: "radio_buttons",
         action_id: "mode",
-        initial_option: {
-          text: {
-            type: "plain_text",
-            text: "Start from scratch",
-          },
-          value: "from_scratch",
-        },
-        options: [
-          {
-            text: {
-              type: "plain_text",
-              text: "Start from scratch",
-            },
-            value: "from_scratch",
-          },
-          {
-            text: {
-              type: "plain_text",
-              text: "From a Slack message",
-            },
-            value: "from_message",
-          },
-        ],
+        initial_option: modeOptions.find((o) => o.value === initialMode) || modeOptions[0],
+        options: modeOptions,
       },
       label: {
         type: "plain_text",
@@ -3151,7 +3310,9 @@ function buildGatherContextModal(
   appNotInChannel = false,
   publishToCoda = true,
   title = "",
-  documentType = DOCUMENT_TYPES.DDR
+  documentType = DOCUMENT_TYPES.DDR,
+  initialLinks = "",
+  initialNotes = ""
 ) {
   const isOdc = documentType === DOCUMENT_TYPES.ODC;
   const noun = isOdc ? "ODC" : "DDR";
@@ -3166,6 +3327,7 @@ function buildGatherContextModal(
       : "";
 
   const blocks = [
+    ...buildStepProgressBlocks(2, 3, sessionId),
     {
       type: "section",
       text: {
@@ -3202,6 +3364,7 @@ function buildGatherContextModal(
         type: "plain_text_input",
         action_id: "links_input",
         multiline: true,
+        ...(initialLinks ? { initial_value: initialLinks } : {}),
         placeholder: {
           type: "plain_text",
           text: "Paste Slack message links here (one per line)",
@@ -3220,6 +3383,7 @@ function buildGatherContextModal(
         type: "plain_text_input",
         action_id: "notes_input",
         multiline: true,
+        ...(initialNotes ? { initial_value: initialNotes } : {}),
         placeholder: {
           type: "plain_text",
           text: "Any extra context, decisions, or reasoning not in the thread...",
@@ -3515,6 +3679,7 @@ function buildClarifyingQuestionsModal(
       text: "Cancel",
     },
     blocks: [
+      ...buildStepProgressBlocks(3, 3, sessionId),
       {
         type: "section",
         text: {
